@@ -7,3 +7,4 @@ description = "Orchestrator CLI for the SuperCrab agents"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 include_dir = "0.7"
+terminal_size = "0.4.4"

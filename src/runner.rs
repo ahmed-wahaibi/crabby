@@ -26,7 +26,16 @@ pub fn run(agent: &Agent, task: &str, model: Option<&str>) -> io::Result<String>
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| io::Error::new(e.kind(), format!("could not start `claude`: {e}")))?;
+        .map_err(|e| {
+            let msg = if e.kind() == io::ErrorKind::NotFound {
+                "the `claude` command was not found on PATH; crabby runs agents through Claude Code, \
+                 so install it (https://claude.com/claude-code) and check that `claude --version` works"
+                    .to_string()
+            } else {
+                format!("could not start `claude`: {e}")
+            };
+            io::Error::new(e.kind(), msg)
+        })?;
     child.stdin.take().expect("stdin is piped").write_all(task.as_bytes())?;
 
     let out = child.wait_with_output()?;
