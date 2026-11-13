@@ -3,8 +3,8 @@
 
 use crate::catalog::Agent;
 use crate::runner::{self, Usage};
-use serde_json::{json, Value};
-use std::{collections::HashSet, io};
+use serde_json::Value;
+use std::{collections::HashSet, io, sync::atomic::AtomicBool};
 
 const MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -143,11 +143,17 @@ pub fn parse_plan(answer: &str, agents: &[Agent]) -> Result<Plan, String> {
 
 /// Asks the router for a plan, retrying once with the validation error.
 /// The usage is the sum over both calls.
-pub fn plan(agents: &[Agent], task: &str, model: &str, effort: &str) -> io::Result<(Plan, Usage)> {
+pub fn plan(
+    agents: &[Agent],
+    task: &str,
+    model: &str,
+    effort: &str,
+    cancel: &AtomicBool,
+) -> io::Result<(Plan, Usage)> {
     let first = prompt(agents, task);
     let mut total = Usage::default();
     let mut ask = |p: &str| -> io::Result<String> {
-        let (answer, usage) = runner::ask(SYSTEM, p, Some(model), Some(effort))?;
+        let (answer, usage) = runner::ask(SYSTEM, p, Some(model), Some(effort), cancel)?;
         if let Some(u) = usage {
             total.input_tokens += u.input_tokens;
             total.output_tokens += u.output_tokens;
@@ -198,18 +204,6 @@ pub fn render(plan: &Plan) -> String {
         out += &format!("unassigned: {}\n", u.replace('\n', " "));
     }
     out
-}
-
-pub fn to_json(plan: &Plan) -> String {
-    let steps: Vec<Value> = plan
-        .steps
-        .iter()
-        .map(|s| {
-            json!({"id": s.id, "agent": s.agent, "task": s.task, "after": s.after,
-                   "model": s.model, "effort": s.effort})
-        })
-        .collect();
-    json!({"steps": steps, "unassigned": plan.unassigned}).to_string()
 }
 
 #[cfg(test)]
@@ -301,7 +295,7 @@ sc-x: "
     }
 
     #[test]
-    fn plan_renders_for_terminal_and_json() {
+    fn plan_renders_for_the_terminal() {
         let answer = format!(
             r#"{{"steps":[{},{}],"unassigned":["paint it"]}}"#,
             step(1, "sc-a", "", "sonnet", "medium"),
@@ -312,8 +306,5 @@ sc-x: "
             render(&p),
             "1  sc-a  sonnet · medium  do 1\n2  sc-c  opus · high  after 1 · do 2\nunassigned: paint it\n"
         );
-        let v: Value = serde_json::from_str(&to_json(&p)).unwrap();
-        assert_eq!(v["steps"][1]["after"], json!([1]));
-        assert_eq!(v["unassigned"][0], "paint it");
     }
 }

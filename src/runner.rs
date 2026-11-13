@@ -8,6 +8,11 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     path::PathBuf,
     process::{self, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -18,6 +23,8 @@ pub enum Event {
     Text(String),
     /// A tool call: the tool's name and its main argument (may be empty or multi-line).
     Tool { name: String, arg: String },
+    /// The id of the Claude Code session, from its first line; `--resume` takes it.
+    Session(String),
 }
 
 /// What the final `result` event of a run reports. Fields the event lacks stay 0 / `None`.
@@ -45,6 +52,7 @@ pub fn run(
     task: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    cancel: &AtomicBool,
     on_event: impl FnMut(Event),
 ) -> io::Result<(String, Option<Usage>)> {
     let tools = agent.tools.join(",");
@@ -70,7 +78,74 @@ pub fn run(
     if let Some(e) = effort {
         cmd.args(["--effort", e]);
     }
-    stream(cmd, task, on_event)
+    stream(cmd, task, cancel, on_event)
+}
+
+/// The system prompt of a plain conversation. Short on purpose: Claude Code's own is
+/// about 40k tokens.
+const CHAT_SYSTEM: &str = "You are Crabby, a coding assistant working in the user's current folder through a terminal. Be concise. Use the tools you have to look at the code before answering questions about it.";
+
+/// The arguments of one turn of a plain conversation. `tools` is both the set of
+/// tools offered and the set pre-approved: a headless session cannot ask.
+fn chat_args(
+    system_file: &std::path::Path,
+    tools: &str,
+    session: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Vec<String> {
+    let mut a: Vec<String> = ["--print", "--output-format", "stream-json", "--verbose"]
+        .map(String::from)
+        .into();
+    let mut add = |flag: &str, v: &str| a.extend([flag.to_string(), v.to_string()]);
+    add("--system-prompt-file", &system_file.to_string_lossy());
+    add("--tools", tools);
+    add("--allowedTools", tools);
+    // Slim set-up as in `ask`: no settings, plugins, skills or MCP servers in the prompt.
+    add("--setting-sources", "");
+    if let Some(s) = session {
+        add("--resume", s);
+    }
+    if let Some(m) = model {
+        add("--model", m);
+    }
+    if let Some(e) = effort {
+        add("--effort", e);
+    }
+    for flag in ["--strict-mcp-config", "--disable-slash-commands"] {
+        a.push(flag.into());
+    }
+    a
+}
+
+/// One turn of a plain conversation in the current directory. `session` is the id
+/// from an earlier turn (see [`Event::Session`]), or `None` to start a conversation.
+/// Returns the final message and usage.
+pub fn chat(
+    prompt: &str,
+    tools: &str,
+    session: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    cancel: &AtomicBool,
+    on_event: impl FnMut(Event),
+) -> io::Result<(String, Option<Usage>)> {
+    let has_break = |s: &str| s.contains(['\n', '\r']);
+    if [Some(tools), session, model]
+        .into_iter()
+        .flatten()
+        .any(has_break)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the model name, session id and tool list must not contain line breaks",
+        ));
+    }
+    let file = TempFile::new(CHAT_SYSTEM)
+        .map_err(|e| io::Error::new(e.kind(), format!("could not save the system prompt: {e}")))?;
+    let mut cmd = Command::new(claude_program());
+    cmd.args(chat_args(&file.0, tools, session, model, effort));
+    stream(cmd, prompt, cancel, on_event)
 }
 
 /// One tool-less `claude` call with its own system prompt instead of Claude Code's
@@ -83,6 +158,7 @@ pub fn ask(
     prompt: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    cancel: &AtomicBool,
 ) -> io::Result<(String, Option<Usage>)> {
     if model.is_some_and(|m| m.contains(['\n', '\r'])) {
         return Err(io::Error::new(
@@ -109,17 +185,18 @@ pub fn ask(
     if let Some(e) = effort {
         cmd.args(["--effort", e]);
     }
-    stream(cmd, prompt, |_| {})
+    stream(cmd, prompt, cancel, |_| {})
 }
 
 /// Feeds `task` to `cmd` and collects the final message and usage from its stream.
 fn stream(
     cmd: Command,
     task: &str,
+    cancel: &AtomicBool,
     mut on_event: impl FnMut(Event),
 ) -> io::Result<(String, Option<Usage>)> {
     let (mut result, mut usage) = (None, None);
-    feed(cmd, task, |line| {
+    feed_with(cmd, task, cancel, |line| {
         read_line(line, &mut on_event, &mut result, &mut usage)
     })
     .map_err(|e| match &result {
@@ -187,6 +264,11 @@ fn read_line(
         return;
     };
     match v["type"].as_str() {
+        Some("system") if v["subtype"] == "init" => {
+            if let Some(id) = v["session_id"].as_str() {
+                on_event(Event::Session(id.to_string()));
+            }
+        }
         Some("assistant") => {
             for block in v["message"]["content"].as_array().into_iter().flatten() {
                 match (block["type"].as_str(), block["text"].as_str()) {
@@ -242,13 +324,26 @@ fn main_arg(input: &Value) -> String {
         .to_string()
 }
 
+/// [`feed_with`] that is never cancelled.
+#[cfg(test)]
+fn feed(cmd: Command, task: &str, on_line: impl FnMut(&str)) -> io::Result<()> {
+    feed_with(cmd, task, &AtomicBool::new(false), on_line)
+}
+
 /// Spawns `cmd`, sends it `task` on stdin and hands each line of its stdout to `on_line`.
-fn feed(mut cmd: Command, task: &str, mut on_line: impl FnMut(&str)) -> io::Result<()> {
+/// Setting `cancel` kills the process (and its children on Windows) and makes this
+/// return an `Interrupted` error. Its stderr is collected into the error, not shown.
+fn feed_with(
+    mut cmd: Command,
+    task: &str,
+    cancel: &AtomicBool,
+    mut on_line: impl FnMut(&str),
+) -> io::Result<()> {
     // The task goes over stdin so it is never mistaken for a flag value.
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
             let msg = if e.kind() == io::ErrorKind::NotFound {
@@ -262,21 +357,56 @@ fn feed(mut cmd: Command, task: &str, mut on_line: impl FnMut(&str)) -> io::Resu
         })?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let pid = child.id();
+    let child = Mutex::new(child);
+    let done = AtomicBool::new(false);
 
     // Write on a second thread while this one drains stdout: writing a task larger
     // than the pipe buffer first would deadlock once the child's stdout pipe fills.
-    let written = std::thread::scope(|s| {
+    let (written, err_text) = std::thread::scope(|s| {
         let writer = s.spawn(move || stdin.write_all(task.as_bytes())); // drop closes stdin
+        let errors = s.spawn(move || {
+            let mut text = String::new();
+            let _ = io::Read::read_to_string(&mut stderr, &mut text);
+            text
+        });
+        s.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Relaxed) {
+                    kill_tree(&mut child.lock().expect("no panic holds the lock"), pid);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
 
         // Bytes, not `lines()`: a line that is not UTF-8 must not end the run.
         for line in BufReader::new(stdout).split(b'\n').map_while(Result::ok) {
             on_line(&String::from_utf8_lossy(&line));
         }
-        writer.join().expect("stdin writer does not panic")
+        done.store(true, Ordering::Relaxed);
+        (
+            writer.join().expect("stdin writer does not panic"),
+            errors.join().unwrap_or_default(),
+        )
     });
-    let status = child.wait()?;
+    let status = child
+        .into_inner()
+        .expect("no panic holds the lock")
+        .wait()?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+    }
     if !status.success() {
-        return Err(io::Error::other(format!("`claude` exited with {status}")));
+        let err = err_text.trim();
+        let skip = err.chars().count().saturating_sub(500);
+        let tail: String = err.chars().skip(skip).collect();
+        return Err(io::Error::other(if tail.is_empty() {
+            format!("`claude` exited with {status}")
+        } else {
+            format!("`claude` exited with {status}: {tail}")
+        }));
     }
     // Checked last: a child that died early breaks the pipe, and its exit status
     // above says more than "broken pipe" does.
@@ -286,6 +416,20 @@ fn feed(mut cmd: Command, task: &str, mut on_line: impl FnMut(&str)) -> io::Resu
             format!("could not send the task to `claude`: {e}"),
         )
     })
+}
+
+/// Kills the process. On Windows a `claude.cmd` install runs `node` under `cmd.exe`,
+/// which `Child::kill` alone would leave running, so the whole tree goes.
+fn kill_tree(child: &mut process::Child, pid: u32) {
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    #[cfg(not(windows))]
+    let _ = pid;
+    let _ = child.kill();
 }
 
 #[cfg(test)]
@@ -380,6 +524,90 @@ not json at all
                 ..Usage::default()
             })
         );
+    }
+
+    #[test]
+    fn stream_init_line_gives_the_session_id() {
+        let line = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
+        let mut events = vec![];
+        read_line(line, &mut |e| events.push(e), &mut None, &mut None);
+        assert_eq!(events, [Event::Session("abc-123".into())]);
+    }
+
+    #[test]
+    fn chat_turns_resume_only_with_a_session_and_offer_only_their_tools() {
+        let f = std::path::Path::new("sys.md");
+        let first = chat_args(f, "Read,Grep", None, Some("haiku"), Some("low"));
+        let later = chat_args(f, "Read,Grep", Some("sid-1"), None, None);
+        assert!(!first.contains(&"--resume".to_string()));
+        assert!(!first.contains(&"--no-session-persistence".to_string()));
+        let pos = |a: &[String], f: &str| a.iter().position(|x| x == f);
+        let i = pos(&later, "--resume").unwrap();
+        assert_eq!(later[i + 1], "sid-1");
+        for a in [&first, &later] {
+            let t = pos(a, "--tools").unwrap();
+            assert_eq!(a[t + 1], "Read,Grep");
+            let t = pos(a, "--allowedTools").unwrap();
+            assert_eq!(a[t + 1], "Read,Grep");
+        }
+        let m = pos(&first, "--model").unwrap();
+        assert_eq!(first[m + 1], "haiku");
+    }
+
+    #[test]
+    fn cancelling_kills_the_process_and_returns_at_once() {
+        let sleeper = if cfg!(windows) {
+            shell("ping -n 30 127.0.0.1 >nul")
+        } else {
+            shell("sleep 30")
+        };
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let err = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            feed_with(sleeper, "", &cancel, |_| {}).unwrap_err()
+        });
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    // Live: spends two Haiku calls. `cargo test -- --ignored live_chat`.
+    #[test]
+    #[ignore]
+    fn live_chat_follow_up_continues_the_conversation() {
+        let no = AtomicBool::new(false);
+        let mut session = None;
+        let (first, usage1) = chat(
+            "Remember the word PINEAPPLE. Reply only: ok",
+            "Read",
+            None,
+            Some("haiku"),
+            Some("low"),
+            &no,
+            |e| {
+                if let Event::Session(id) = e {
+                    session = Some(id);
+                }
+            },
+        )
+        .unwrap();
+        eprintln!("first: {first}\n{usage1:?}");
+        let id = session.expect("a session id in the first reply");
+        let (second, usage2) = chat(
+            "What word did I ask you to remember? Reply with the word only.",
+            "Read",
+            Some(&id),
+            Some("haiku"),
+            Some("low"),
+            &no,
+            |_| {},
+        )
+        .unwrap();
+        eprintln!("second: {second}\n{usage2:?}");
+        assert!(second.to_uppercase().contains("PINEAPPLE"), "{second}");
     }
 
     #[test]
