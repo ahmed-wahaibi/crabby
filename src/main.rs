@@ -1,270 +1,403 @@
+mod app;
 mod catalog;
+mod commands;
+mod display;
 mod outcome;
 mod router;
 mod runner;
+mod settings;
+mod ui;
 
+use app::{Effect, Job, JobEvent, Msg, State};
 use catalog::Agent;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::Parser;
+use commands::{Command, Input};
 use outcome::Status;
-use runner::Event;
+use ratatui::crossterm::{
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
+    execute,
+};
+use settings::{Effort, Mode};
 use std::{
     io::{self, IsTerminal, Read, Write},
+    panic::{self, AssertUnwindSafe},
     path::PathBuf,
     process::ExitCode,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 const AFTER_HELP: &str = "\
 Examples:
-  crabby list
-  crabby list --category language-specialists
-  crabby list | grep -i rust
-  crabby run sc-rust-engineer \"make the parser report line numbers\"
-  crabby run sc-code-reviewer - < task.md
-  crabby run sc-debugger \"find the flaky test\" --model opus --effort high
-  crabby run sc-cloud-architect \"sketch the queue\" --model fable --effort max
-  crabby plan \"add rate limiting to the upload endpoint and cover it with tests\"
-  crabby plan --json \"fix the flaky login test\" --router-model sonnet
+  crabby                                   open the chat
+  crabby -p \"what does src/main.rs do?\"    one message, reply on stdout
+  crabby -p \"/plan add rate limiting to the upload endpoint\"
+  crabby -p \"/run sc-rust-engineer make the parser report line numbers\"
+  crabby -p - < task.txt                   read the input from stdin
+  crabby -p \"/agents rust\" | cut -f1
+
+In the chat, type /help for the commands: /agents, /run, /plan, /model, /effort,
+/mode, /clear and /quit. A plain message is a conversation with one Claude Code
+session in the current folder, in `read` mode (read and search tools only) unless
+you set `/mode edit` or `--mode edit`.
 
 Effort ceiling: a run on Fable (`fable` or `claude-fable-*`) is capped at `medium`,
-and without `--effort` it is passed `--effort medium`. Asking for more stops before `claude` starts and asks you to type `yes`; any other
-answer, or no terminal to ask on, runs at `medium`. Without `--model` crabby reads
-the model from ANTHROPIC_MODEL or Claude Code's settings files, and if it cannot
-tell, it treats the run as possibly Fable.
+and without an effort it is passed `--effort medium`. Asking for more asks you to
+type `yes` in the chat; with -p there is nobody to ask, so it runs at `medium`.
+Without `--model` crabby reads the model from ANTHROPIC_MODEL or Claude Code's
+settings files, and if it cannot tell, it treats the run as possibly Fable.
 
-Exit codes:
-   0  the agent reported `done` (also: list, --help, --version)
-   1  the agent reported `partial`
-   2  the agent reported `blocked`
-   3  the agent finished without a result block
-   4  crabby could not run it (unknown agent, no agents found, `claude` missing or failed)
-  64  usage error (bad flag or missing argument)";
+Exit codes with -p:
+   0  done (a reply, a plan or a list; for /run, the agent reported `done`)
+   1  /run: the agent reported `partial`
+   2  /run: the agent reported `blocked`
+   3  /run: the agent finished without a result block
+   4  crabby could not do it (unknown agent, no agents found, `claude` missing or failed)
+  64  usage error (bad flag, bad command, or no terminal and no -p)";
 
 #[derive(Parser)]
-#[command(name = "crabby", version, about = "Orchestrator for the SuperCrab agents", after_help = AFTER_HELP)]
+#[command(name = "crabby", version, about = "Interactive chat for Claude Code with the SuperCrab agents", after_help = AFTER_HELP)]
 struct Cli {
+    /// Run one input without the interface and print the result: a message or a
+    /// /command. Use `-` to read it from stdin
+    #[arg(short = 'p', long = "print", value_name = "INPUT")]
+    print: Option<String>,
     /// Read agents from this `categories` folder instead of the built-in set
-    #[arg(long, global = true, value_name = "DIR")]
+    #[arg(long, value_name = "DIR")]
     agents_dir: Option<PathBuf>,
-    #[command(subcommand)]
-    command: Cmd,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// List the available agents
-    ///
-    /// On a terminal, agents are grouped by category and descriptions are cut to
-    /// the window width. When piped, each line is `name<TAB>category<TAB>description`
-    /// with the full description.
-    List {
-        /// Only show this category, e.g. `language-specialists`
-        #[arg(long)]
-        category: Option<String>,
-    },
-    /// Run one agent on a task in the current directory
-    ///
-    /// The agent runs as a headless `claude` process, so Claude Code must be
-    /// installed. Its text goes to stdout as it arrives and its tool calls to
-    /// stderr; the exit code reflects the status in its result block (see
-    /// `crabby --help`).
-    Run {
-        /// Agent name as shown by `crabby list`, e.g. `sc-rust-engineer`
-        agent: String,
-        /// What the agent should do. Quote it; use `-` to read it from stdin,
-        /// and put `--` before a task that starts with a dash
-        #[arg(required = true)]
-        task: Vec<String>,
-        /// Model to run the agent on (defaults to your Claude Code setting)
-        #[arg(long)]
-        model: Option<String>,
-        /// Reasoning effort. On Fable, above `medium` needs a typed `yes` (see `crabby --help`)
-        #[arg(long, value_enum)]
-        effort: Option<Effort>,
-    },
-    /// Choose agents for a task and print the plan; nothing is run
-    ///
-    /// A small model reads the agent list and the task and answers with steps:
-    /// agent, model, effort, dependencies and instruction. It runs as a tool-less
-    /// `claude` call and costs one short call (see the usage line on stderr).
-    Plan {
-        /// What needs doing. Quote it
-        #[arg(required = true)]
-        task: Vec<String>,
-        /// Print the plan as JSON on stdout
-        #[arg(long)]
-        json: bool,
-        /// Model that makes the plan
-        #[arg(long, default_value = "haiku")]
-        router_model: String,
-        /// Effort of the planning call
-        #[arg(long, value_enum, default_value = "low")]
-        router_effort: Effort,
-    },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum Effort {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl Effort {
-    fn name(self) -> String {
-        self.to_possible_value()
-            .expect("no skipped variants")
-            .get_name()
-            .to_string()
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum Gate {
-    Proceed,
-    Ask,
-    CapToMedium,
-    /// Possibly Fable with no `--effort`: pass `medium` instead of Claude Code's default.
-    DefaultMedium,
-}
-
-/// Decides whether a run may start at the requested effort. `model` is `None` when
-/// it is unknown, which is treated as possibly Fable.
-fn gate(model: Option<&str>, effort: Option<Effort>, terminal: bool) -> Gate {
-    let fable = model.is_none_or(|m| {
-        let m = m.trim().to_ascii_lowercase();
-        m == "fable" || m.starts_with("claude-fable")
-    });
-    match effort {
-        _ if !fable => Gate::Proceed,
-        None => Gate::DefaultMedium,
-        Some(e) if e <= Effort::Medium => Gate::Proceed,
-        Some(_) if terminal => Gate::Ask,
-        Some(_) => Gate::CapToMedium,
-    }
-}
-
-/// `1234567` -> `1,234,567`.
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// The one-line run summary for stderr.
-fn summary(u: &runner::Usage, effort: Option<Effort>) -> String {
-    let mut parts = vec!["crabby:".to_string()];
-    if !u.models.is_empty() {
-        parts.push(u.models.join(", "));
-        parts.push("·".into());
-    }
-    parts.push(format!(
-        "effort {} · {} in / {} out",
-        effort.map_or("default".into(), Effort::name),
-        commas(u.input_tokens),
-        commas(u.output_tokens)
-    ));
-    if u.cache_read_tokens > 0 {
-        parts.push(format!("· {} cached", commas(u.cache_read_tokens)));
-    }
-    if u.cache_write_tokens > 0 {
-        parts.push(format!("· {} written", commas(u.cache_write_tokens)));
-    }
-    if let Some(c) = u.cost_usd {
-        parts.push(format!("· ${c:.4}"));
-    }
-    if let Some(ms) = u.duration_ms {
-        parts.push(format!("· {}s", (ms + 500) / 1000));
-    }
-    parts.join(" ")
-}
-
-/// The model Claude Code would use when `--model` is not given: ANTHROPIC_MODEL, else
-/// the first `model` in the local, project or user settings.
-// shortcut: managed (enterprise) settings and an `env` block in settings are not read,
-// so a model set only there is missed; `None` then makes the caller assume Fable.
-fn configured_model() -> Option<String> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
-    let files = [
-        PathBuf::from(".claude/settings.local.json"),
-        PathBuf::from(".claude/settings.json"),
-    ]
-    .into_iter()
-    .chain(home.map(|h| PathBuf::from(h).join(".claude/settings.json")));
-    std::env::var("ANTHROPIC_MODEL")
-        .ok()
-        .or_else(|| {
-            files.into_iter().find_map(|f| {
-                let v: serde_json::Value =
-                    serde_json::from_str(&std::fs::read_to_string(f).ok()?).ok()?;
-                v["model"].as_str().map(String::from)
-            })
-        })
-        .filter(|m| !m.trim().is_empty() && m != "default")
-}
-
-/// Asks on the terminal; true only for exactly `yes`.
-fn confirm(agent: &str, model: Option<&str>, effort: Effort) -> bool {
-    let which = match model {
-        Some(m) => format!("model {m}"),
-        None => "a model that could not be determined (it may be Fable)".into(),
-    };
-    eprint!(
-        "crabby: {agent} is about to run on {which} at {} effort. Fable above medium effort costs more.\nType `yes` to run at {}, anything else runs at medium: ",
-        effort.name(),
-        effort.name()
-    );
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer).is_ok() && answer.trim_end_matches(['\r', '\n']) == "yes"
+    /// Model for messages and /run (defaults to your Claude Code setting)
+    #[arg(long)]
+    model: Option<String>,
+    /// Reasoning effort. On Fable, above `medium` needs a typed `yes` (see --help)
+    #[arg(long, value_enum)]
+    effort: Option<Effort>,
+    /// What a plain conversation may do: `read` pre-approves read and search tools,
+    /// `edit` also file edits and shell commands
+    #[arg(long, value_enum, default_value = "read")]
+    mode: Mode,
 }
 
 /// Exit code for anything crabby itself could not do.
 const FAILED: u8 = 4;
+const USAGE: u8 = 64;
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {msg}");
     ExitCode::from(FAILED)
 }
 
-/// Renders the agent list. `width` is the terminal width; `None` means stdout is
-/// not a terminal and gets one tab-separated line per agent.
-fn render_list(agents: &[&Agent], width: Option<usize>) -> String {
-    let mut out = String::new();
-    let Some(width) = width else {
-        for a in agents {
-            out += &format!("{}\t{}\t{}\n", a.name, a.category, a.description);
-        }
-        return out;
+fn usage(msg: impl std::fmt::Display) -> ExitCode {
+    eprintln!("error: {msg}\nFor more information, try '--help'.");
+    ExitCode::from(USAGE)
+}
+
+/// The exit code for the status in an agent's result block.
+fn status_exit(status: Option<Status>) -> u8 {
+    match status {
+        Some(Status::Done) => 0,
+        Some(Status::Partial) => 1,
+        Some(Status::Blocked) => 2,
+        None => 3,
+    }
+}
+
+/// Runs a job to its end on the calling thread, reporting through `emit`. The last
+/// event is always `Done` or `Failed`.
+fn execute(job: Job, agents: &[Agent], cancel: &AtomicBool, mut emit: impl FnMut(JobEvent)) {
+    let mut forward = |e: runner::Event| {
+        emit(match e {
+            runner::Event::Text(t) => JobEvent::Text(t),
+            runner::Event::Tool { name, arg } => JobEvent::Tool { name, arg },
+            runner::Event::Session(s) => JobEvent::Session(s),
+        })
     };
-    let pad = agents.iter().map(|a| a.name.len()).max().unwrap_or(0);
-    // Room left for the description; one column spare so a full line never wraps.
-    let room = width.saturating_sub(pad + 5);
-    let mut current = "";
-    for a in agents {
-        if a.category != current {
-            if !current.is_empty() {
-                out.push('\n');
-            }
-            current = &a.category;
-            out += &format!("{current}\n");
+    let result = match job {
+        Job::Chat {
+            prompt,
+            session,
+            mode,
+            model,
+            effort,
+        } => runner::chat(
+            &prompt,
+            mode.tools(),
+            session.as_deref(),
+            model.as_deref(),
+            effort.map(Effort::name).as_deref(),
+            cancel,
+            &mut forward,
+        ),
+        Job::Run {
+            agent,
+            task,
+            model,
+            effort,
+        } => runner::run(
+            &agent,
+            &task,
+            model.as_deref(),
+            effort.map(Effort::name).as_deref(),
+            cancel,
+            &mut forward,
+        ),
+        // The router is always Haiku at low effort, which the Fable ceiling never touches.
+        Job::Plan { task } => {
+            router::plan(agents, &task, "haiku", "low", cancel).map(|(plan, usage)| {
+                let text = router::render(&plan);
+                forward(runner::Event::Text(text.trim_end().to_string()));
+                (text, Some(usage))
+            })
         }
-        if room < 20 {
-            out += &format!("  {}\n", a.name); // too narrow for a useful description
-        } else if a.description.chars().count() > room {
-            let cut: String = a.description.chars().take(room - 1).collect();
-            out += &format!("  {:<pad$}  {cut}…\n", a.name);
+    };
+    emit(match result {
+        Ok((output, usage)) => JobEvent::Done { output, usage },
+        Err(e) => JobEvent::Failed(e.to_string()),
+    });
+}
+
+/// `crabby -p`: one input, no interface.
+fn print_mode(input: String, agents: &[Agent], cli: &Cli) -> ExitCode {
+    let input = if input == "-" {
+        let mut text = String::new();
+        if let Err(e) = io::stdin().read_to_string(&mut text) {
+            return fail(format!("could not read the input from stdin: {e}"));
+        }
+        text
+    } else {
+        input
+    };
+    if input.trim().is_empty() {
+        return fail("the input is empty; give a message or a /command");
+    }
+    let parsed = match commands::parse(&input) {
+        Ok(p) => p,
+        Err(e) => return usage(e),
+    };
+    let known = cli.model.clone().or_else(settings::configured_model);
+    // Nobody to ask: Fable above medium runs at medium.
+    let effort = settings::effective_effort(known.as_deref(), cli.effort, false);
+    if cli.effort > effort {
+        eprintln!("crabby: no terminal to ask on, so this runs at medium effort (Fable ceiling)");
+    }
+    let (job, run_name) = match parsed {
+        Input::Message(prompt) => (
+            Job::Chat {
+                prompt,
+                session: None,
+                mode: cli.mode,
+                model: cli.model.clone(),
+                effort,
+            },
+            None,
+        ),
+        Input::Command(Command::Help) => {
+            println!("{}", commands::help());
+            return ExitCode::SUCCESS;
+        }
+        Input::Command(Command::Agents(text)) => {
+            let shown = commands::filter(agents, &text);
+            if shown.is_empty() {
+                return fail(format!("no agent matches `{text}`"));
+            }
+            let width = io::stdout()
+                .is_terminal()
+                .then(|| terminal_size::terminal_size().map_or(80, |(w, _)| w.0 as usize));
+            // One write, error ignored: `crabby -p /agents | head` must not panic on a closed pipe.
+            let _ = io::stdout()
+                .lock()
+                .write_all(display::render_list(&shown, width).as_bytes());
+            return ExitCode::SUCCESS;
+        }
+        Input::Command(Command::Run { agent, task }) => {
+            match commands::find_agent(agents, &agent) {
+                Err(e) => return fail(e),
+                Ok(a) => (
+                    Job::Run {
+                        agent: a.clone(),
+                        task,
+                        model: cli.model.clone(),
+                        effort,
+                    },
+                    Some(a.name.clone()),
+                ),
+            }
+        }
+        Input::Command(Command::Plan(task)) => (Job::Plan { task }, None),
+        Input::Command(
+            Command::Model(_)
+            | Command::Effort(_)
+            | Command::Mode(_)
+            | Command::Clear
+            | Command::Quit,
+        ) => {
+            return usage(
+                "that command only works in the chat; with -p use --model, --effort and --mode",
+            );
+        }
+    };
+    if io::stderr().is_terminal() {
+        eprintln!("crabby: working via claude, this can take a few minutes...");
+    }
+    let shown_effort = if matches!(job, Job::Plan { .. }) {
+        Some(Effort::Low)
+    } else {
+        effort
+    };
+    let mut exit = ExitCode::SUCCESS;
+    execute(job, agents, &AtomicBool::new(false), |event| match event {
+        JobEvent::Text(text) => {
+            // Errors ignored: `crabby -p ... | head` must not panic on a closed pipe.
+            let mut out = io::stdout().lock();
+            let _ = out.write_all(text.as_bytes());
+            if !text.ends_with('\n') {
+                let _ = out.write_all(b"\n");
+            }
+            let _ = out.flush();
+        }
+        JobEvent::Tool { name, arg } => {
+            let arg: String = arg.lines().next().unwrap_or("").chars().take(100).collect();
+            eprintln!("crabby: {name} {arg}");
+        }
+        JobEvent::Session(_) => {}
+        JobEvent::Failed(e) => exit = fail(e),
+        JobEvent::Done { output, usage } => {
+            if let Some(u) = &usage {
+                eprintln!("{}", display::summary(u, shown_effort));
+            }
+            if let Some(name) = &run_name {
+                let status = outcome::parse(&output).and_then(|o| o.status);
+                if status.is_none() {
+                    eprintln!(
+                        "warning: {name} did not end with a result block, so its status is unknown (exit 3)"
+                    );
+                }
+                exit = ExitCode::from(status_exit(status));
+            }
+        }
+    });
+    exit
+}
+
+/// Puts the terminal back: bracketed paste off, alternate screen left, raw mode off.
+fn restore_terminal() {
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    ratatui::restore();
+}
+
+fn chat(agents: Vec<Agent>, warnings: Vec<String>, cli: &Cli) -> ExitCode {
+    let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    let cwd = std::env::current_dir().map_or_else(|_| ".".into(), |p| p.display().to_string());
+    let size = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    let agents = Arc::new(agents);
+    let mut st = State::new(
+        agents.clone(),
+        settings::configured_model(),
+        cwd,
+        color,
+        size,
+        &warnings,
+    );
+    st.model = cli.model.as_ref().map(|m| m.to_ascii_lowercase());
+    st.effort = cli.effort;
+    st.mode = cli.mode;
+
+    let mut terminal = match ratatui::try_init() {
+        Ok(t) => t,
+        Err(e) => return fail(format!("could not set up the terminal: {e}")),
+    };
+    // try_init's hook already restores the terminal on a panic in this thread; this
+    // one adds bracketed paste, and keeps job threads (which report their own panics)
+    // from tearing the screen down or printing over it.
+    let previous = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if thread::current().name() == Some("main") {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
+            previous(info);
+        }
+    }));
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
+
+    let result = event_loop(&mut terminal, &mut st, &agents);
+    restore_terminal();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(e),
+    }
+}
+
+fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    st: &mut State,
+    agents: &Arc<Vec<Agent>>,
+) -> io::Result<()> {
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let mut current: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)> = None;
+    loop {
+        terminal.draw(|f| ui::draw(f, st))?;
+        let mut msgs = vec![];
+        // The model calls run on their own threads, so this only waits for a key.
+        if event::poll(Duration::from_millis(60))? {
+            loop {
+                match event::read()? {
+                    Event::Key(k) => msgs.push(Msg::Key(k)),
+                    Event::Paste(text) => msgs.push(Msg::Paste(text)),
+                    Event::Resize(w, h) => msgs.push(Msg::Resize(w, h)),
+                    _ => {}
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
         } else {
-            out += &format!("  {:<pad$}  {}\n", a.name, a.description);
+            msgs.push(Msg::Tick);
+        }
+        msgs.extend(rx.try_iter());
+        for msg in msgs {
+            for effect in app::update(st, msg) {
+                match effect {
+                    Effect::Start { id, job } => {
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        let (tx, agents, flag) = (tx.clone(), agents.clone(), cancel.clone());
+                        let handle =
+                            thread::Builder::new().name("job".into()).spawn(move || {
+                                let send = |event| {
+                                    let _ = tx.send(Msg::Job { id, event });
+                                };
+                                let run = panic::catch_unwind(AssertUnwindSafe(|| {
+                                    execute(job, &agents, &flag, send)
+                                }));
+                                if let Err(p) = run {
+                                    let why = p
+                                        .downcast_ref::<&str>()
+                                        .map(|s| s.to_string())
+                                        .or_else(|| p.downcast_ref::<String>().cloned())
+                                        .unwrap_or_default();
+                                    send(JobEvent::Failed(format!("internal error: {why}")));
+                                }
+                            })?;
+                        current = Some((cancel, handle));
+                    }
+                    Effect::Stop => {
+                        if let Some((cancel, _)) = &current {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Effect::Quit => {
+                        // Wait for the kill, so no `claude` process outlives crabby.
+                        if let Some((cancel, handle)) = current.take() {
+                            cancel.store(true, Ordering::Relaxed);
+                            let _ = handle.join();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
-    out
 }
 
 fn main() -> ExitCode {
@@ -273,13 +406,20 @@ fn main() -> ExitCode {
         Err(e) => {
             let _ = e.print();
             // clap's own usage code is 2, which here means `blocked`.
-            return ExitCode::from(if e.use_stderr() { 64 } else { 0 });
+            return ExitCode::from(if e.use_stderr() { USAGE } else { 0 });
         }
     };
-    let (agents, warnings) = catalog::load(cli.agents_dir.as_deref());
-    for w in &warnings {
-        eprintln!("warning: skipped {w}");
+    if let Some(m) = &cli.model {
+        if let Err(e) = settings::check_model(m) {
+            return usage(e);
+        }
     }
+    if cli.print.is_none() && !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        return usage(
+            "crabby opens an interactive chat and needs a terminal; use `crabby -p \"<message or /command>\"` in scripts",
+        );
+    }
+    let (agents, warnings) = catalog::load(cli.agents_dir.as_deref());
     if agents.is_empty() {
         return match &cli.agents_dir {
             Some(d) => fail(format!(
@@ -289,162 +429,14 @@ fn main() -> ExitCode {
             None => fail("this build has no agents embedded; rebuild with the agents submodule checked out"),
         };
     }
-
-    match cli.command {
-        Cmd::List { category } => {
-            let shown: Vec<&Agent> = agents
-                .iter()
-                .filter(|a| category.as_ref().is_none_or(|c| *c == a.category))
-                .collect();
-            if shown.is_empty() {
-                let mut cats: Vec<&str> = agents.iter().map(|a| a.category.as_str()).collect();
-                cats.dedup();
-                return fail(format!(
-                    "no category named `{}`; categories: {}",
-                    category.unwrap_or_default(),
-                    cats.join(", ")
-                ));
+    match cli.print.clone() {
+        Some(input) => {
+            for w in &warnings {
+                eprintln!("warning: skipped {w}");
             }
-            let stdout = io::stdout();
-            let width = stdout
-                .is_terminal()
-                .then(|| terminal_size::terminal_size().map_or(80, |(w, _)| w.0 as usize));
-            // One write, error ignored: `crabby list | head` must not panic on a closed pipe.
-            let _ = stdout
-                .lock()
-                .write_all(render_list(&shown, width).as_bytes());
-            ExitCode::SUCCESS
+            print_mode(input, &agents, &cli)
         }
-        Cmd::Plan {
-            task,
-            json,
-            router_model,
-            router_effort,
-        } => {
-            let task = task.join(" ");
-            if task.trim().is_empty() {
-                return fail("the task is empty; say what needs doing");
-            }
-            // Never prompt here: a router on Fable is capped at medium.
-            let effort = match gate(Some(&router_model), Some(router_effort), false) {
-                Gate::CapToMedium => Effort::Medium,
-                _ => router_effort,
-            };
-            if io::stderr().is_terminal() {
-                eprintln!("crabby: planning via {router_model}...");
-            }
-            let (plan, usage) = match router::plan(&agents, &task, &router_model, &effort.name()) {
-                Ok(p) => p,
-                Err(e) => return fail(e),
-            };
-            let text = if json {
-                router::to_json(&plan)
-                    + "
-"
-            } else {
-                router::render(&plan)
-            };
-            let _ = io::stdout().lock().write_all(text.as_bytes());
-            eprintln!("{}", summary(&usage, Some(effort)));
-            ExitCode::SUCCESS
-        }
-        Cmd::Run {
-            agent,
-            task,
-            model,
-            effort,
-        } => {
-            let Some(agent) = agents.iter().find(|a| a.name == agent) else {
-                let key = agent.trim_start_matches("sc-");
-                let near: Vec<&str> = agents
-                    .iter()
-                    .filter(|a| !key.is_empty() && a.name.contains(key))
-                    .map(|a| a.name.as_str())
-                    .take(5)
-                    .collect();
-                return fail(if near.is_empty() {
-                    format!("no agent named `{agent}`; run `crabby list` to see the names")
-                } else {
-                    format!(
-                        "no agent named `{agent}`; did you mean: {}",
-                        near.join(", ")
-                    )
-                });
-            };
-            let from_stdin = task == ["-"];
-            let task = if from_stdin {
-                let mut t = String::new();
-                if let Err(e) = io::stdin().read_to_string(&mut t) {
-                    return fail(format!("could not read the task from stdin: {e}"));
-                }
-                t
-            } else {
-                task.join(" ")
-            };
-            if task.trim().is_empty() {
-                return fail("the task is empty; say what the agent should do");
-            }
-            let known = model.clone().or_else(configured_model);
-            let terminal = !from_stdin && io::stdin().is_terminal() && io::stderr().is_terminal();
-            let effort = match (gate(known.as_deref(), effort, terminal), effort) {
-                (Gate::Ask, Some(e)) if !confirm(&agent.name, known.as_deref(), e) => {
-                    eprintln!("crabby: running at medium effort");
-                    Some(Effort::Medium)
-                }
-                (Gate::CapToMedium, _) => {
-                    eprintln!("crabby: no terminal to ask on, so this runs at medium effort (Fable ceiling)");
-                    Some(Effort::Medium)
-                }
-                (Gate::DefaultMedium, _) => Some(Effort::Medium),
-                _ => effort,
-            };
-            if io::stderr().is_terminal() {
-                eprintln!(
-                    "crabby: running {} via claude, this can take a few minutes...",
-                    agent.name
-                );
-            }
-            let shown = |event| match event {
-                Event::Text(text) => {
-                    // Errors ignored: `crabby run ... | head` must not panic on a closed pipe.
-                    let mut out = io::stdout().lock();
-                    let _ = out.write_all(text.as_bytes());
-                    if !text.ends_with('\n') {
-                        let _ = out.write_all(b"\n");
-                    }
-                    let _ = out.flush();
-                }
-                Event::Tool { name, arg } => {
-                    let arg: String = arg.lines().next().unwrap_or("").chars().take(100).collect();
-                    eprintln!("crabby: {name} {arg}");
-                }
-            };
-            let (output, usage) = match runner::run(
-                agent,
-                &task,
-                model.as_deref(),
-                effort.map(Effort::name).as_deref(),
-                shown,
-            ) {
-                Ok(o) => o,
-                Err(e) => return fail(e),
-            };
-            if let Some(u) = &usage {
-                eprintln!("{}", summary(u, effort));
-            }
-            match outcome::parse(&output).and_then(|o| o.status) {
-                Some(Status::Done) => ExitCode::SUCCESS,
-                Some(Status::Partial) => ExitCode::from(1),
-                Some(Status::Blocked) => ExitCode::from(2),
-                None => {
-                    eprintln!(
-                        "warning: {} did not end with a result block, so its status is unknown (exit 3)",
-                        agent.name
-                    );
-                    ExitCode::from(3)
-                }
-            }
-        }
+        None => chat(agents, warnings, &cli),
     }
 }
 
@@ -452,91 +444,39 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    fn agent(name: &str, category: &str, description: &str) -> Agent {
-        Agent {
-            name: name.into(),
-            description: description.into(),
-            category: category.into(),
-            tools: vec![],
-            body: String::new(),
+    #[test]
+    fn the_old_subcommands_are_gone_and_unknown_arguments_are_usage_errors() {
+        for args in [
+            vec!["crabby", "list"],
+            vec!["crabby", "run", "sc-a", "task"],
+            vec!["crabby", "plan", "task"],
+            vec!["crabby", "--nope"],
+        ] {
+            let e = Cli::try_parse_from(args.clone()).err().expect("an error");
+            assert!(e.use_stderr(), "{args:?}");
+            assert!(e.to_string().contains("--help"), "{args:?}: {e}");
         }
     }
 
     #[test]
-    fn gate_covers_every_branch() {
-        use Effort::*;
-        let g = gate;
-        // Not Fable, or nothing above medium asked for: go.
-        assert_eq!(g(Some("opus"), Some(Max), true), Gate::Proceed);
-        assert_eq!(g(Some("claude-opus-5-5"), Some(High), false), Gate::Proceed);
-        assert_eq!(g(Some("opus"), None, true), Gate::Proceed);
-        assert_eq!(g(Some("fable"), Some(Low), false), Gate::Proceed);
-        assert_eq!(g(Some("fable"), Some(Medium), false), Gate::Proceed);
-        assert_eq!(g(None, Some(Medium), false), Gate::Proceed);
-        // Fable above medium: ask on a terminal, else cap.
-        for e in [High, Xhigh, Max] {
-            assert_eq!(g(Some("fable"), Some(e), true), Gate::Ask);
-            assert_eq!(g(Some("fable"), Some(e), false), Gate::CapToMedium);
-        }
-        // Names are matched case-insensitively; look-alikes are not Fable.
-        assert_eq!(g(Some("Claude-FABLE-5-2"), Some(High), true), Gate::Ask);
-        assert_eq!(g(Some("FABLE"), Some(High), false), Gate::CapToMedium);
-        assert_eq!(g(Some("my-fable"), Some(High), true), Gate::Proceed);
-        // Fable or unknown with no effort: pass medium explicitly, no prompt.
-        assert_eq!(g(Some("fable"), None, true), Gate::DefaultMedium);
-        assert_eq!(
-            g(Some("claude-fable-5-2"), None, false),
-            Gate::DefaultMedium
-        );
-        assert_eq!(g(None, None, true), Gate::DefaultMedium);
-        // Unknown model counts as possibly Fable.
-        assert_eq!(g(None, Some(High), true), Gate::Ask);
-        assert_eq!(g(None, Some(Max), false), Gate::CapToMedium);
+    fn print_takes_a_value_and_dash_means_stdin() {
+        let cli = Cli::try_parse_from(["crabby", "-p", "hello", "--mode", "edit"])
+            .ok()
+            .unwrap();
+        assert_eq!(cli.print.as_deref(), Some("hello"));
+        assert_eq!(cli.mode, Mode::Edit);
+        let cli = Cli::try_parse_from(["crabby", "-p", "-"]).ok().unwrap();
+        assert_eq!(cli.print.as_deref(), Some("-"));
+        let cli = Cli::try_parse_from(["crabby"]).ok().unwrap();
+        assert!(cli.print.is_none());
+        assert_eq!(cli.mode, Mode::Read);
     }
 
     #[test]
-    fn summary_line_shows_what_the_event_gave() {
-        let u = runner::Usage {
-            input_tokens: 1204,
-            output_tokens: 310,
-            cache_read_tokens: 18400,
-            cost_usd: Some(0.00312),
-            duration_ms: Some(11600),
-            models: vec!["claude-haiku-5-5".into()],
-            ..Default::default()
-        };
-        assert_eq!(
-            summary(&u, Some(Effort::Low)),
-            "crabby: claude-haiku-5-5 · effort low · 1,204 in / 310 out · 18,400 cached · $0.0031 · 12s"
-        );
-        assert_eq!(
-            summary(&runner::Usage::default(), None),
-            "crabby: effort default · 0 in / 0 out"
-        );
-    }
-
-    #[test]
-    fn list_is_tab_separated_when_piped_and_fits_the_terminal_otherwise() {
-        let long = "x".repeat(200);
-        let (a, b) = (agent("sc-a", "one", "Short."), agent("sc-bb", "two", &long));
-        let agents = [&a, &b];
-
-        assert_eq!(
-            render_list(&agents, None),
-            format!("sc-a\tone\tShort.\nsc-bb\ttwo\t{long}\n")
-        );
-
-        let wide = render_list(&agents, Some(60));
-        assert!(
-            wide.starts_with("one\n  sc-a   Short.\n\ntwo\n  sc-bb  xxx"),
-            "{wide}"
-        );
-        assert!(wide.lines().all(|l| l.chars().count() < 60), "{wide}");
-        assert!(wide.trim_end().ends_with('…'));
-
-        assert_eq!(
-            render_list(&agents, Some(20)),
-            "one\n  sc-a\n\ntwo\n  sc-bb\n"
-        );
+    fn statuses_keep_their_exit_codes() {
+        assert_eq!(status_exit(Some(Status::Done)), 0);
+        assert_eq!(status_exit(Some(Status::Partial)), 1);
+        assert_eq!(status_exit(Some(Status::Blocked)), 2);
+        assert_eq!(status_exit(None), 3);
     }
 }
