@@ -26,14 +26,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Running an agent for real (`crabby run …`) needs [Claude Code](https://claude.com/claude-code) installed and signed in, and spends tokens on your account. The unit tests do not.
+Running anything for real (a message or `/run` in the chat, or `crabby -p …`) needs [Claude Code](https://claude.com/claude-code) installed and signed in, and spends tokens on your account. The unit tests do not. The chat itself needs a real terminal; its logic and drawing are tested without one (a pure `update` function in `app` and drawing to ratatui's test backend in `ui`). Try the screen by hand before changing it.
 
 ## Rules for a change
 
 1. **Keep it small.** One pull request does one thing. Prefer the smallest change that fully solves the problem, and reuse what is already in the codebase or the standard library before adding a dependency.
 2. **Test new logic.** A new branch, parser or decision gets a unit test. Keep decisions in pure functions so they can be tested without starting `claude`.
-3. **Do not change behaviour silently.** Exit codes, the format of piped `list` output and the result block are relied on by scripts. A change to any of them must be called out in the pull request.
-4. **No terminal or printing code in the core modules.** `catalog`, `outcome` and `runner` return data; `main` decides how to show it.
+3. **Do not change behaviour silently.** Exit codes, the format of piped `/agents` output and the result block are relied on by scripts. A change to any of them must be called out in the pull request.
+4. **No terminal or printing code in the core modules.** `catalog`, `outcome`, `runner` and `router` return data; `main` decides how to show it. `app` holds the chat state and a pure `update`, `ui` only draws, `commands` only parses.
 5. **Count the tokens.** Crabby exists partly to keep token use down. If a change adds a model call or makes a prompt longer, say what it costs in the pull request.
 6. **Never commit secrets,** API keys or anything from your Claude Code configuration.
 
@@ -59,7 +59,7 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org/):
 | `ci` | continuous integration |
 | `chore` | anything else that does not touch source or tests |
 
-Scopes in use: `cli`, `run`, `runner`, `router`, `catalog`, `outcome`, `github`.
+Scopes in use: `cli`, `run`, `runner`, `router`, `catalog`, `outcome`, `github`, `chat`.
 
 Examples:
 

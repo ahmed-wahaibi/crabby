@@ -9,22 +9,23 @@ Crabby takes a task, picks the right SuperCrab agents for it, runs them through 
 | All agents from `sc-agents` compiled into the binary (pinned by submodule commit) | built |
 | Every agent validated at load: header fields, name matches file, result section present | built |
 | Invalid, unreadable or duplicate agents skipped with a warning, never a crash | built |
-| `crabby list`, grouped by category, fitted to the terminal width | built |
-| `crabby list --category <name>` | built |
-| Tab-separated output when piped, for `grep`, `cut` and scripts | built |
+| `/agents`, grouped by category, fitted to the window width | built |
+| `/agents <text>`: only agents with the text in the name, category or description | built |
+| Tab-separated output when piped (`crabby -p "/agents" \| cut -f1`), for `grep`, `cut` and scripts | built |
 | `--agents-dir <folder>` to use a working copy instead of the built-in set | built |
-| `crabby show <agent>`: full description, tools, default model and effort | planned |
+| `/show <agent>`: full description, tools, default model and effort | planned |
 
 ## 2. Running one agent
 
 | Feature | Status |
 |---|---|
-| `crabby run <agent> "<task>"` in the current folder, as a headless Claude Code process | built |
-| Task from standard input: `crabby run <agent> - < task.md` | built |
+| `/run <agent> <task>` in the current folder, as a headless Claude Code process, streaming into the chat | built |
+| From scripts: `crabby -p "/run <agent> <task>"`, or the whole input from standard input with `crabby -p -` | built |
 | Only the tools named in the agent's header are permitted | built |
-| Live output: agent text on stdout, tool activity on stderr | built |
+| Live output: agent text and one-line tool entries in the transcript (with `-p`: text on stdout, tool activity on stderr) | built |
 | Result block parsed into status, summary, changes, verification, follow-ups | built |
-| Exit code from the status: 0 done, 1 partial, 2 blocked, 3 no result block, 4 could not run, 64 usage error | built |
+| Result block parsed again into a status line after the run, with the usage line | built |
+| Exit code from the status with `-p`: 0 done, 1 partial, 2 blocked, 3 no result block, 4 could not run, 64 usage error | built |
 | "Did you mean" suggestions for a mistyped agent name | built |
 | Works with Claude Code installed as `claude.exe` or `claude.cmd` | built |
 | Agent files of any size (instructions passed by file, not command line) | built |
@@ -35,8 +36,7 @@ Each agent run gets its own model and its own effort level. Neither is fixed in 
 
 | Feature | Status |
 |---|---|
-| `--model <name>` on `crabby run` | built |
-| `--effort <low\|medium\|high\|xhigh\|max>` on `crabby run` | built |
+| `/model [name]` and `/effort [level]` in the chat; `--model` and `--effort` as starting values and with `-p` | built |
 | Model accepted as an alias (`fable`, `opus`, `sonnet`, `haiku`) or an exact version (`claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) | planned |
 | Aliases resolved to the exact model version at run time, and the exact version recorded with the run | planned |
 | Router chooses the model for every step of a plan, from the difficulty and risk of that step; the effort judge below picks the effort | planned |
@@ -46,8 +46,8 @@ Each agent run gets its own model and its own effort level. Neither is fixed in 
 | Fallback model per run, used when the chosen model is overloaded or unavailable | planned |
 | Automatic step-up: a step that comes back `blocked` or `partial` can be retried once on a stronger model or higher effort | planned |
 | Model version, effort, tokens and cost stored for every run in the run log | planned |
-| **Fable effort ceiling:** a run on Fable is capped at `medium` effort. Anything higher, whether you asked for it, the judge picked it or a retry stepped it up, stops and asks you to type `yes` first | built |
-| Any other answer, or no terminal to ask on (scripts, CI, `--yes`), runs the step at `medium` and says so | built |
+| **Fable effort ceiling:** a run on Fable is capped at `medium` effort. Anything higher, whether you asked for it, the judge picked it or a retry stepped it up, stops and asks you to type `yes` first (in the chat, in the input box) | built for `/effort` and `/model`; the judge and retries are planned |
+| Any other answer, or no terminal to ask on (`-p`, scripts, CI, `--yes`), runs the step at `medium` and says so | built |
 | The ceiling applies per step, so approving one step does not approve the next | planned |
 
 ### Effortless: effort picked per run
@@ -82,7 +82,7 @@ Starting defaults (changeable in config). With the effort judge on, the effort c
 
 | Feature | Status |
 |---|---|
-| `crabby plan "<task>"`: the router picks one or several agents and prints a plan (`--json` for scripts) | built |
+| `/plan <task>`: the router picks one or several agents and shows a plan; also `crabby -p "/plan <task>"` | built |
 | Router reads the catalogue by name and description, with no hard-coded agent list | built |
 | Plan output: ordered steps, the agent for each, its instruction, and which steps depend on which | built |
 | Steps the router cannot match to any agent are marked unassigned, not forced onto a poor fit | built |
@@ -146,10 +146,12 @@ Running `crabby` with no arguments opens a chat that works the way Claude Code's
 
 | Feature | Status |
 |---|---|
-| Chat interface: prompt line, streaming replies, inline tool activity, multi-line input, history with the arrow keys | planned |
-| A plain message goes to one Claude Code session in the current project, with no router and no extra agents | planned |
-| Conversation kept across messages and resumable after restart | planned |
-| `/` opens a command list with completion; `/help` describes each command | planned |
+| Chat interface: transcript, input box, status line; streaming replies, inline tool activity, multi-line input (Alt+Enter), history with the arrow keys | built |
+| A plain message goes to one Claude Code session in the current project, with no router and no extra agents | built |
+| Conversation kept across messages (`--resume`) | built |
+| Conversation resumable after restart | planned |
+| `/mode read\|edit`: what a plain conversation may do, since a headless session cannot ask. `read` pre-approves read and search tools, `edit` also file edits and shell commands | built |
+| `/` opens a command list with completion (Tab); `/help` describes each command | built |
 | **`/orchestrate <task>`**: the router picks agents and drafts a plan, you approve it, and the agents run (sections 4 and 5) | planned |
 | **`/create-issue <description>`**: drafts a GitHub issue for the current project (title, body, labels, taken from your description and the repo), shows it to you, and creates it once you approve | planned |
 | **`/docs [what]`**: brings the project's documentation in line with the code, for everything or only what you name, and shows the changes before they are kept | planned |
@@ -157,17 +159,21 @@ Running `crabby` with no arguments opens a chat that works the way Claude Code's
 | **`/review all`**: reviews every open pull request in the current project | planned |
 | **`/review <description>`**: you describe the pull request in words and Crabby finds the matching one, asking when more than one fits | planned |
 | Reviews list findings by severity with file and line; posting them to the pull request as a comment happens only when you approve | planned |
-| `/agents` to browse the catalogue, `/run <agent> <task>` for one agent | planned |
-| `/model`, `/effort`, `/memory`, `/cost` and `/clear` | planned |
-| Every command also works from the shell, e.g. `crabby review all`, for scripts and CI | planned |
+| `/agents` to browse the catalogue, `/run <agent> <task>` for one agent | built |
+| `/model`, `/effort` and `/clear` | built |
+| `/memory` and `/cost` | planned |
+| Where it makes sense, a command also works from the shell with `crabby -p "/command"`, for scripts and CI | built for the commands above, planned for the rest |
 | During `/orchestrate`: a plan panel with a status per step beside the live output of the selected agent | planned |
 | Switch between running agents with the arrow keys | planned |
-| Status bar: model, effort, agents running, tokens, cost so far | planned |
+| Status line: model, effort, mode, tokens, cost so far, current folder | built |
+| Status line: agents running | planned |
 | Model and effort shown per step | planned |
-| Scrollback and search within an agent's output | planned |
-| Stop one agent or the whole run from the keyboard | planned |
-| Plain non-interactive output when not attached to a terminal | built for `run`, planned for plans |
-| Colour that respects `NO_COLOR` and works in Windows Terminal | planned |
+| Search within an agent's output | planned |
+| Stop a reply or a `/run` from the keyboard (Esc or Ctrl+C); the `claude` process is killed | built |
+| Stop one agent of several | planned |
+| Plain non-interactive output with `crabby -p`; without `-p` and without a terminal Crabby exits with a usage error | built |
+| Colour that respects `NO_COLOR` | built |
+| Scrolling with PageUp and PageDown | built |
 
 ## 9. Mascot
 
