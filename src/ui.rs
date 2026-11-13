@@ -2,7 +2,7 @@
 
 use crate::{
     app::{Entry, State},
-    commands, display,
+    commands, display, mascot,
 };
 use ratatui::{
     layout::{Constraint, Layout, Position},
@@ -127,9 +127,18 @@ fn clean_lines(text: &str) -> Vec<String> {
 }
 
 pub fn transcript(st: &State, width: usize) -> Vec<Line<'static>> {
-    st.entries
-        .iter()
-        .flat_map(|e| entry_lines(e, width, st.color))
+    // The crab sits above the banner, so it scrolls away with the transcript.
+    let crab = st.mascot
+        && st.width >= mascot::MIN_WIDTH
+        && st.height >= mascot::MIN_HEIGHT
+        && matches!(st.entries.first(), Some(Entry::Banner(_)));
+    let top = if crab { mascot::lines() } else { vec![] };
+    top.into_iter()
+        .chain(
+            st.entries
+                .iter()
+                .flat_map(|e| entry_lines(e, width, st.color)),
+        )
         .collect()
 }
 
@@ -374,6 +383,57 @@ mod tests {
             "{s:?}"
         );
         assert!(s[11].ends_with("C:\\proj"), "{s:?}");
+    }
+
+    #[test]
+    fn the_welcome_screen_draws_the_crab_or_only_the_name() {
+        let draw_buf = |st: &State| {
+            let mut term = Terminal::new(TestBackend::new(st.width, st.height)).unwrap();
+            term.draw(|f| draw(f, st)).unwrap();
+            term.backend().buffer().clone()
+        };
+        let rgb = |n: u32| Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8);
+        let (red, dark, white) = (rgb(0xe02b2b), rgb(0xa31515), rgb(0xffffff));
+        let mut st = state(60, 16);
+        st.mascot = true;
+        let buf = draw_buf(&st);
+        let at = |x: u16, y: u16| &buf[(20 + x, y)]; // 60 wide: the 20-wide sprite starts at 20
+                                                     // First row: transparent-over-red, red-over-dark, red-over-transparent, empty.
+        assert_eq!((at(0, 0).symbol(), at(0, 0).fg), ("▄", red));
+        assert_eq!(
+            (at(1, 0).symbol(), at(1, 0).fg, at(1, 0).bg),
+            ("▀", red, dark)
+        );
+        assert_eq!((at(2, 0).symbol(), at(2, 0).fg), ("▀", red));
+        assert_eq!((at(3, 0).symbol(), at(3, 0).bg), (" ", Color::Reset));
+        // Last row (sprite pixel rows 10 and 11).
+        assert_eq!((at(0, 5).symbol(), at(0, 5).bg), (" ", Color::Reset));
+        assert_eq!(
+            (at(1, 5).symbol(), at(1, 5).fg, at(1, 5).bg),
+            ("▀", red, dark)
+        );
+        // Two equal pixels are a space with a background: no glyph, no seam.
+        assert_eq!((at(6, 1).symbol(), at(6, 1).bg), (" ", white));
+        // The name follows the sprite, and the input box and status line are intact.
+        let s = screen(&st);
+        assert!(s[6].starts_with("crabby "), "{s:?}");
+        assert!(
+            s[12].starts_with('┌') && s[15].contains("mode read"),
+            "{s:?}"
+        );
+        // Too short for the crab, or the mascot off: the name only, no half blocks.
+        st.height = 13;
+        st.mascot = true;
+        let small = screen(&st).join("\n");
+        st.height = 16;
+        st.mascot = false;
+        let off = screen(&st).join("\n");
+        for text in [small, off] {
+            assert!(
+                text.contains("crabby ") && !text.contains(['▀', '▄']),
+                "{text}"
+            );
+        }
     }
 
     #[test]

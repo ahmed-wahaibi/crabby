@@ -137,6 +137,8 @@ pub struct State {
     pub totals: Totals,
     pub cwd: String,
     pub color: bool,
+    /// Draw the crab on the welcome screen: colour allowed and true colour reported.
+    pub mascot: bool,
     pub width: u16,
     pub height: u16,
     pub tick: usize,
@@ -173,6 +175,7 @@ impl State {
             totals: Totals::default(),
             cwd,
             color,
+            mascot: false,
             width: size.0,
             height: size.1,
             tick: 0,
