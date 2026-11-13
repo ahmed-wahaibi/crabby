@@ -5,6 +5,7 @@ mod runner;
 use catalog::Agent;
 use clap::{Parser, Subcommand};
 use outcome::Status;
+use runner::Event;
 use std::{
     io::{self, IsTerminal, Read, Write},
     path::PathBuf,
@@ -52,8 +53,9 @@ enum Cmd {
     /// Run one agent on a task in the current directory
     ///
     /// The agent runs as a headless `claude` process, so Claude Code must be
-    /// installed. Its output goes to stdout; the exit code reflects the status in
-    /// its result block (see `crabby --help`).
+    /// installed. Its text goes to stdout as it arrives and its tool calls to
+    /// stderr; the exit code reflects the status in its result block (see
+    /// `crabby --help`).
     Run {
         /// Agent name as shown by `crabby list`, e.g. `sc-rust-engineer`
         agent: String,
@@ -193,11 +195,25 @@ fn main() -> ExitCode {
                     agent.name
                 );
             }
-            let output = match runner::run(agent, &task, model.as_deref()) {
+            let shown = |event| match event {
+                Event::Text(text) => {
+                    // Errors ignored: `crabby run ... | head` must not panic on a closed pipe.
+                    let mut out = io::stdout().lock();
+                    let _ = out.write_all(text.as_bytes());
+                    if !text.ends_with('\n') {
+                        let _ = out.write_all(b"\n");
+                    }
+                    let _ = out.flush();
+                }
+                Event::Tool { name, arg } => {
+                    let arg: String = arg.lines().next().unwrap_or("").chars().take(100).collect();
+                    eprintln!("crabby: {name} {arg}");
+                }
+            };
+            let output = match runner::run(agent, &task, model.as_deref(), shown) {
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
-            let _ = io::stdout().lock().write_all(output.as_bytes());
             match outcome::parse(&output).and_then(|o| o.status) {
                 Some(Status::Done) => ExitCode::SUCCESS,
                 Some(Status::Partial) => ExitCode::from(1),

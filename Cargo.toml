@@ -2,10 +2,12 @@
 name = "crabby"
 version = "0.1.0"
 edition = "2021"
+# The code itself needs 1.82 (`Option::is_none_or`); the locked clap 4.6 needs 1.85.
 rust-version = "1.85"
 description = "Orchestrator CLI for the SuperCrab agents"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 include_dir = "0.7"
+serde_json = "1"
 terminal_size = "0.4.4"
