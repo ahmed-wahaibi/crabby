@@ -30,6 +30,7 @@ pub fn run(
     agent: &Agent,
     task: &str,
     model: Option<&str>,
+    effort: Option<&str>,
     mut on_event: impl FnMut(Event),
 ) -> io::Result<String> {
     let tools = agent.tools.join(",");
@@ -51,6 +52,9 @@ pub fn run(
         .args(["--allowedTools", &tools]);
     if let Some(m) = model {
         cmd.args(["--model", m]);
+    }
+    if let Some(e) = effort {
+        cmd.args(["--effort", e]);
     }
     let mut result = None;
     feed(cmd, task, |line| {

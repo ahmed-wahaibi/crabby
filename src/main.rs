@@ -3,7 +3,7 @@ mod outcome;
 mod runner;
 
 use catalog::Agent;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use outcome::Status;
 use runner::Event;
 use std::{
@@ -19,6 +19,14 @@ Examples:
   crabby list | grep -i rust
   crabby run sc-rust-engineer \"make the parser report line numbers\"
   crabby run sc-code-reviewer - < task.md
+  crabby run sc-debugger \"find the flaky test\" --model opus --effort high
+  crabby run sc-cloud-architect \"sketch the queue\" --model fable --effort max
+
+Effort ceiling: a run on Fable (`fable` or `claude-fable-*`) is capped at `medium`.
+Asking for more stops before `claude` starts and asks you to type `yes`; any other
+answer, or no terminal to ask on, runs at `medium`. Without `--model` crabby reads
+the model from ANTHROPIC_MODEL or Claude Code's settings files, and if it cannot
+tell, it treats the run as possibly Fable.
 
 Exit codes:
    0  the agent reported `done` (also: list, --help, --version)
@@ -66,7 +74,90 @@ enum Cmd {
         /// Model to run the agent on (defaults to your Claude Code setting)
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort. On Fable, above `medium` needs a typed `yes` (see `crabby --help`)
+        #[arg(long, value_enum)]
+        effort: Option<Effort>,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    fn name(self) -> String {
+        self.to_possible_value()
+            .expect("no skipped variants")
+            .get_name()
+            .to_string()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Gate {
+    Proceed,
+    Ask,
+    CapToMedium,
+}
+
+/// Decides whether a run may start at the requested effort. `model` is `None` when
+/// it is unknown, which is treated as possibly Fable.
+fn gate(model: Option<&str>, effort: Option<Effort>, terminal: bool) -> Gate {
+    let fable = model.is_none_or(|m| {
+        let m = m.trim().to_ascii_lowercase();
+        m == "fable" || m.starts_with("claude-fable")
+    });
+    if !fable || effort.is_none_or(|e| e <= Effort::Medium) {
+        Gate::Proceed
+    } else if terminal {
+        Gate::Ask
+    } else {
+        Gate::CapToMedium
+    }
+}
+
+/// The model Claude Code would use when `--model` is not given: ANTHROPIC_MODEL, else
+/// the first `model` in the local, project or user settings.
+// shortcut: managed (enterprise) settings and an `env` block in settings are not read,
+// so a model set only there is missed; `None` then makes the caller assume Fable.
+fn configured_model() -> Option<String> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    let files = [
+        PathBuf::from(".claude/settings.local.json"),
+        PathBuf::from(".claude/settings.json"),
+    ]
+    .into_iter()
+    .chain(home.map(|h| PathBuf::from(h).join(".claude/settings.json")));
+    std::env::var("ANTHROPIC_MODEL")
+        .ok()
+        .or_else(|| {
+            files.into_iter().find_map(|f| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(f).ok()?).ok()?;
+                v["model"].as_str().map(String::from)
+            })
+        })
+        .filter(|m| !m.trim().is_empty() && m != "default")
+}
+
+/// Asks on the terminal; true only for exactly `yes`.
+fn confirm(agent: &str, model: Option<&str>, effort: Effort) -> bool {
+    let which = match model {
+        Some(m) => format!("model {m}"),
+        None => "a model that could not be determined (it may be Fable)".into(),
+    };
+    eprint!(
+        "crabby: {agent} is about to run on {which} at {} effort. Fable above medium effort costs more.\nType `yes` to run at {}, anything else runs at medium: ",
+        effort.name(),
+        effort.name()
+    );
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).is_ok() && answer.trim_end_matches(['\r', '\n']) == "yes"
 }
 
 /// Exit code for anything crabby itself could not do.
@@ -159,7 +250,12 @@ fn main() -> ExitCode {
                 .write_all(render_list(&shown, width).as_bytes());
             ExitCode::SUCCESS
         }
-        Cmd::Run { agent, task, model } => {
+        Cmd::Run {
+            agent,
+            task,
+            model,
+            effort,
+        } => {
             let Some(agent) = agents.iter().find(|a| a.name == agent) else {
                 let key = agent.trim_start_matches("sc-");
                 let near: Vec<&str> = agents
@@ -177,7 +273,8 @@ fn main() -> ExitCode {
                     )
                 });
             };
-            let task = if task == ["-"] {
+            let from_stdin = task == ["-"];
+            let task = if from_stdin {
                 let mut t = String::new();
                 if let Err(e) = io::stdin().read_to_string(&mut t) {
                     return fail(format!("could not read the task from stdin: {e}"));
@@ -189,6 +286,19 @@ fn main() -> ExitCode {
             if task.trim().is_empty() {
                 return fail("the task is empty; say what the agent should do");
             }
+            let known = model.clone().or_else(configured_model);
+            let terminal = !from_stdin && io::stdin().is_terminal() && io::stderr().is_terminal();
+            let effort = match (gate(known.as_deref(), effort, terminal), effort) {
+                (Gate::Ask, Some(e)) if !confirm(&agent.name, known.as_deref(), e) => {
+                    eprintln!("crabby: running at medium effort");
+                    Some(Effort::Medium)
+                }
+                (Gate::CapToMedium, _) => {
+                    eprintln!("crabby: no terminal to ask on, so this runs at medium effort (Fable ceiling)");
+                    Some(Effort::Medium)
+                }
+                _ => effort,
+            };
             if io::stderr().is_terminal() {
                 eprintln!(
                     "crabby: running {} via claude, this can take a few minutes...",
@@ -210,7 +320,13 @@ fn main() -> ExitCode {
                     eprintln!("crabby: {name} {arg}");
                 }
             };
-            let output = match runner::run(agent, &task, model.as_deref(), shown) {
+            let output = match runner::run(
+                agent,
+                &task,
+                model.as_deref(),
+                effort.map(Effort::name).as_deref(),
+                shown,
+            ) {
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
@@ -242,6 +358,31 @@ mod tests {
             tools: vec![],
             body: String::new(),
         }
+    }
+
+    #[test]
+    fn gate_covers_every_branch() {
+        use Effort::*;
+        let g = gate;
+        // Not Fable, or nothing above medium asked for: go.
+        assert_eq!(g(Some("opus"), Some(Max), true), Gate::Proceed);
+        assert_eq!(g(Some("claude-opus-5-5"), Some(High), false), Gate::Proceed);
+        assert_eq!(g(Some("fable"), None, true), Gate::Proceed);
+        assert_eq!(g(Some("fable"), Some(Low), false), Gate::Proceed);
+        assert_eq!(g(Some("fable"), Some(Medium), false), Gate::Proceed);
+        assert_eq!(g(None, Some(Medium), false), Gate::Proceed);
+        // Fable above medium: ask on a terminal, else cap.
+        for e in [High, Xhigh, Max] {
+            assert_eq!(g(Some("fable"), Some(e), true), Gate::Ask);
+            assert_eq!(g(Some("fable"), Some(e), false), Gate::CapToMedium);
+        }
+        // Names are matched case-insensitively; look-alikes are not Fable.
+        assert_eq!(g(Some("Claude-FABLE-5-2"), Some(High), true), Gate::Ask);
+        assert_eq!(g(Some("FABLE"), Some(High), false), Gate::CapToMedium);
+        assert_eq!(g(Some("my-fable"), Some(High), true), Gate::Proceed);
+        // Unknown model counts as possibly Fable.
+        assert_eq!(g(None, Some(High), true), Gate::Ask);
+        assert_eq!(g(None, Some(Max), false), Gate::CapToMedium);
     }
 
     #[test]
