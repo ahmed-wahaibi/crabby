@@ -171,7 +171,26 @@ Caveman's own "Auto" feature also picks model and effort. Crabby leaves that to 
 | Confirmation prompt before a plan that includes agents with shell access runs in a folder for the first time | planned |
 | Temporary files cleaned up after every run | built (not on Ctrl-C) |
 
-## 11. History and configuration
+## 11. Global memory (never committed)
+
+Rules you tell Crabby to remember are kept in one store on your machine, outside every project, and applied to all work Crabby does in any project. Saying "save to memory the rule of no co-author" while working in one repo makes that rule apply in every future project, and nothing is written to that repo.
+
+| Feature | Status |
+|---|---|
+| One global store in your user folder (`~/.crabby/memory/`), outside every repository, so it can never be committed or pushed | planned |
+| Saving in plain words, from the TUI or the command line: "save to memory …", or `crabby remember "<rule>"` | planned |
+| A saved rule applies to every agent run in every project from then on | planned |
+| Nothing is added to the current project's `CLAUDE.md`, and no file inside the project is created or changed | planned |
+| The rules are passed to each agent with its instructions at run time, not written into the agent files | planned |
+| `crabby memory` to list the rules, `crabby forget <id>` to remove one, and plain-text files you can edit by hand | planned |
+| Order of authority: what you say in the current task, then a memory rule, then the agent's own defaults | planned |
+| A new rule that contradicts an existing one is flagged, and you choose which stays | planned |
+| Each rule stored as one short line with the date and the project it was saved from | planned |
+| Token cost kept small: rules are sent as a compact list, with a size cap and a warning when the store grows past it | planned |
+| Optional project-only rule (`--project`), still stored outside the repo and keyed by the project's path | planned |
+| `--no-memory` to run once without any saved rules | planned |
+
+## 12. History and configuration
 
 | Feature | Status |
 |---|---|
@@ -180,7 +199,7 @@ Caveman's own "Auto" feature also picks model and effort. Crabby leaves that to 
 | Config file for defaults: model and effort by kind of work, per-agent overrides, parallel limit, spend cap, mascot | planned |
 | Project-level config that overrides the user-level one | planned |
 
-## 12. Distribution
+## 13. Distribution
 
 | Feature | Status |
 |---|---|
