@@ -113,7 +113,7 @@ Planned, in order. Details are in [FEATURES.md](FEATURES.md).
 
 1. **Plan approval:** accept, edit or reject the plan Crabby drafts before anything runs.
 2. **Multi-agent execution:** independent steps in parallel, results passed between steps, a review stage after every change.
-3. **More chat commands:** `/orchestrate`, `/review`, `/docs`, `/create-issue`, `/memory` and `/cost`, and the Crabby mascot.
+3. **More chat commands:** `/orchestrate`, `/review`, `/docs`, `/create-issue`, `/memory` and `/cost`, and the mascot's animation.
 4. **Token savings:** effort picked per step, terse agent-to-agent hand-offs, and a token ledger.
 5. **Global memory:** rules you save once apply to every project, without touching any repository.
 

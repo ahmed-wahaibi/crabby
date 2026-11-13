@@ -179,7 +179,8 @@ Running `crabby` with no arguments opens a chat that works the way Claude Code's
 
 | Feature | Status |
 |---|---|
-| Pixel-art crab in a red cape with a chest shield, drawn in coloured half-block characters | planned |
+| Pixel-art crab on the welcome screen, drawn in coloured half-block characters from `assets/crab.txt`; shown only in a window of at least 24x14, with colour allowed (`NO_COLOR` unset) and a true-colour terminal (`COLORTERM=truecolor`), otherwise just the name | built |
+| The cape and chest shield | planned |
 | Animation states: idle, typing while agents run, flying on success, slumped on a blocked step | planned |
 | Option to turn the mascot off | planned |
 
