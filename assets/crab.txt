@@ -1,0 +1,20 @@
+.aa..............aa.
+ab..a..........a..ab
+ab.ab.ccc..ccc.ab.ab
+ebaeb.ckc..ckc.abaeb
+eeeb..ccc..ccc..aee.
+.eb....e....e....eb.
+..abbddaaaaadaaabb..
+...ddaaafaafaaadd...
+...eeeeaaffaaaaee...
+..ab.aaeaaaaaee.be..
+.ab.abb.eeee.eee.b..
+.b..b..........b.b..
+
+a e02b2b main red
+b a31515 dark red
+c ffffff white (eyes)
+k 0a0a0a black (pupil)
+d f25c5c light red
+e c41f1f mid red
+f 5e0b0b mouth

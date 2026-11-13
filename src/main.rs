@@ -2,6 +2,7 @@ mod app;
 mod catalog;
 mod commands;
 mod display;
+mod mascot;
 mod outcome;
 mod router;
 mod runner;
@@ -301,6 +302,7 @@ fn chat(agents: Vec<Agent>, warnings: Vec<String>, cli: &Cli) -> ExitCode {
         size,
         &warnings,
     );
+    st.mascot = color && mascot::truecolor();
     st.model = cli.model.as_ref().map(|m| m.to_ascii_lowercase());
     st.effort = cli.effort;
     st.mode = cli.mode;
