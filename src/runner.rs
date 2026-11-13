@@ -9,10 +9,10 @@ use std::{
     path::PathBuf,
     process::{self, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex, PoisonError,
     },
-    time::Duration,
+    time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -52,13 +52,14 @@ pub fn run(
     task: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    resume: Option<&str>,
     cancel: &AtomicBool,
     on_event: impl FnMut(Event),
 ) -> io::Result<(String, Option<Usage>)> {
     let tools = agent.tools.join(",");
     // A `claude.cmd` install goes through cmd.exe, which cannot take a line break.
     let has_break = |s: &str| s.contains(['\n', '\r']);
-    if has_break(&tools) || model.is_some_and(has_break) {
+    if has_break(&tools) || model.is_some_and(has_break) || resume.is_some_and(has_break) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "the model name and the agent's tool list must not contain line breaks",
@@ -72,6 +73,9 @@ pub fn run(
         .arg("--append-system-prompt-file")
         .arg(&prompt.0)
         .args(["--allowedTools", &tools]);
+    if let Some(s) = resume {
+        cmd.args(["--resume", s]);
+    }
     if let Some(m) = model {
         cmd.args(["--model", m]);
     }
@@ -196,7 +200,7 @@ fn stream(
     mut on_event: impl FnMut(Event),
 ) -> io::Result<(String, Option<Usage>)> {
     let (mut result, mut usage) = (None, None);
-    feed_with(cmd, task, cancel, |line| {
+    feed_with(cmd, task, cancel, IDLE_LIMIT, |line| {
         read_line(line, &mut on_event, &mut result, &mut usage)
     })
     .map_err(|e| match &result {
@@ -327,7 +331,13 @@ fn main_arg(input: &Value) -> String {
 /// [`feed_with`] that is never cancelled.
 #[cfg(test)]
 fn feed(cmd: Command, task: &str, on_line: impl FnMut(&str)) -> io::Result<()> {
-    feed_with(cmd, task, &AtomicBool::new(false), on_line)
+    feed_with(
+        cmd,
+        task,
+        &AtomicBool::new(false),
+        Duration::from_secs(3600),
+        on_line,
+    )
 }
 
 /// Spawns `cmd`, sends it `task` on stdin and hands each line of its stdout to `on_line`.
@@ -337,6 +347,7 @@ fn feed_with(
     mut cmd: Command,
     task: &str,
     cancel: &AtomicBool,
+    idle: Duration,
     mut on_line: impl FnMut(&str),
 ) -> io::Result<()> {
     // The task goes over stdin so it is never mistaken for a flag value.
@@ -359,8 +370,16 @@ fn feed_with(
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let pid = child.id();
+    CHILDREN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(pid);
     let child = Mutex::new(child);
     let done = AtomicBool::new(false);
+    let stalled = AtomicBool::new(false);
+    let started = Instant::now();
+    // Milliseconds since `started` at the last line of output.
+    let last_line = AtomicU64::new(0);
 
     // Write on a second thread while this one drains stdout: writing a task larger
     // than the pipe buffer first would deadlock once the child's stdout pipe fills.
@@ -374,6 +393,13 @@ fn feed_with(
         s.spawn(|| {
             while !done.load(Ordering::Relaxed) {
                 if cancel.load(Ordering::Relaxed) {
+                    kill_tree(&mut child.lock().expect("no panic holds the lock"), pid);
+                    return;
+                }
+                let quiet =
+                    started.elapsed().as_millis() as u64 - last_line.load(Ordering::Relaxed);
+                if quiet > idle.as_millis() as u64 {
+                    stalled.store(true, Ordering::Relaxed);
                     kill_tree(&mut child.lock().expect("no panic holds the lock"), pid);
                     return;
                 }
@@ -391,12 +417,23 @@ fn feed_with(
             errors.join().unwrap_or_default(),
         )
     });
-    let status = child
-        .into_inner()
-        .expect("no panic holds the lock")
-        .wait()?;
+    let status = child.into_inner().expect("no panic holds the lock").wait();
+    CHILDREN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|p| *p != pid);
+    let status = status?;
     if cancel.load(Ordering::Relaxed) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+    }
+    if stalled.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "`claude` stopped responding for {} seconds and was stopped",
+                idle.as_secs()
+            ),
+        ));
     }
     if !status.success() {
         let err = err_text.trim();
@@ -421,6 +458,11 @@ fn feed_with(
 /// Kills the process. On Windows a `claude.cmd` install runs `node` under `cmd.exe`,
 /// which `Child::kill` alone would leave running, so the whole tree goes.
 fn kill_tree(child: &mut process::Child, pid: u32) {
+    kill_pid(pid);
+    let _ = child.kill();
+}
+
+fn kill_pid(pid: u32) {
     #[cfg(windows)]
     let _ = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
@@ -428,8 +470,41 @@ fn kill_tree(child: &mut process::Child, pid: u32) {
         .stderr(Stdio::null())
         .status();
     #[cfg(not(windows))]
-    let _ = pid;
-    let _ = child.kill();
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
+
+/// Process ids of the running `claude` children.
+static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Stops every `claude` child still running, so none outlive a crash or an exit.
+pub fn kill_all() {
+    let pids = std::mem::take(&mut *CHILDREN.lock().unwrap_or_else(PoisonError::into_inner));
+    for pid in pids {
+        kill_pid(pid);
+    }
+}
+
+/// How long `claude` may print nothing before it counts as not responding.
+// shortcut: a fixed 15 minutes; a tool that runs silently for longer is stopped too.
+const IDLE_LIMIT: Duration = Duration::from_secs(15 * 60);
+
+/// `claude --version`, or `None` if it does not answer in three seconds.
+pub fn claude_version() -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = Command::new(claude_program())
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output();
+        let _ = tx.send(
+            out.ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()),
+        );
+    });
+    rx.recv_timeout(Duration::from_secs(3))
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
 }
 
 #[cfg(test)]
@@ -568,10 +643,92 @@ not json at all
                 std::thread::sleep(Duration::from_millis(200));
                 cancel.store(true, Ordering::Relaxed);
             });
-            feed_with(sleeper, "", &cancel, |_| {}).unwrap_err()
+            feed_with(sleeper, "", &cancel, Duration::from_secs(3600), |_| {}).unwrap_err()
         });
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_child_that_prints_nothing_for_too_long_is_stopped_as_not_responding() {
+        let sleeper = if cfg!(windows) {
+            shell("ping -n 30 127.0.0.1 >nul")
+        } else {
+            shell("sleep 30")
+        };
+        let started = Instant::now();
+        let err = feed_with(
+            sleeper,
+            "",
+            &AtomicBool::new(false),
+            Duration::from_millis(300),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn kill_all_stops_a_registered_child_and_forgets_it() {
+        let mut child = if cfg!(windows) {
+            shell("ping -n 30 127.0.0.1 >nul")
+        } else {
+            shell("sleep 30")
+        }
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+        CHILDREN.lock().unwrap().push(child.id());
+        kill_all();
+        assert!(child.wait().is_ok_and(|s| !s.success()));
+        assert!(!CHILDREN.lock().unwrap().contains(&child.id()));
+    }
+
+    // Live: spends two Haiku calls. `cargo test -- --ignored live_resume`.
+    // A /run killed after its first reply, then resumed with `--resume`.
+    #[test]
+    #[ignore]
+    fn live_resume_continues_a_killed_run() {
+        let agent = Agent {
+            name: "sc-live".into(),
+            description: "d".into(),
+            category: "c".into(),
+            tools: vec!["Read".into()],
+            body: "You are a terse test agent.".into(),
+        };
+        let cancel = AtomicBool::new(false);
+        let mut session = None;
+        let killed = run(
+            &agent,
+            "Remember the word PELICAN. Reply only: ok",
+            Some("haiku"),
+            Some("low"),
+            None,
+            &cancel,
+            |e| match e {
+                Event::Session(id) => session = Some(id),
+                Event::Text(_) => cancel.store(true, Ordering::Relaxed),
+                _ => {}
+            },
+        );
+        eprintln!("first run ended: {killed:?}");
+        let id = session.expect("a session id");
+        let (second, usage) = run(
+            &agent,
+            "What word did I ask you to remember? Reply with the word only.",
+            Some("haiku"),
+            Some("low"),
+            Some(&id),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        eprintln!(
+            "resumed: {second}
+{usage:?}"
+        );
+        assert!(second.to_uppercase().contains("PELICAN"), "{second}");
     }
 
     // Live: spends two Haiku calls. `cargo test -- --ignored live_chat`.
