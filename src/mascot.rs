@@ -26,7 +26,9 @@ fn cell(top: Option<Color>, bottom: Option<Color>) -> Span<'static> {
 
 /// The sprite as centred lines, two pixel rows per line.
 pub fn lines() -> Vec<Line<'static>> {
-    let (rows, palette) = DATA.split_once("\n\n").unwrap_or((DATA, ""));
+    // A Windows checkout can turn the file's line endings into CRLF.
+    let data = DATA.replace('\r', "");
+    let (rows, palette) = data.split_once("\n\n").unwrap_or((&data, ""));
     let colour = |ch: char| {
         let hex = palette
             .lines()
@@ -42,7 +44,8 @@ pub fn lines() -> Vec<Line<'static>> {
         .collect();
     px.chunks(2)
         .map(|pair| {
-            let at = |r: usize, x: usize| pair.get(r).and_then(|row| row[x]);
+            // `get`, not indexing: a ragged data file must not be able to crash the welcome screen.
+            let at = |r: usize, x: usize| pair.get(r).and_then(|row| row.get(x).copied().flatten());
             let spans = (0..pair[0].len()).map(|x| cell(at(0, x), at(1, x)));
             Line::from(spans.collect::<Vec<_>>()).centered()
         })
