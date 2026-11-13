@@ -3,7 +3,7 @@
 use crate::catalog::Agent;
 
 /// Name, usage and what it does, in the order `/help` lists them.
-pub const COMMANDS: [(&str, &str, &str); 9] = [
+pub const COMMANDS: [(&str, &str, &str); 11] = [
     ("help", "/help", "list the commands"),
     (
         "agents",
@@ -31,6 +31,16 @@ pub const COMMANDS: [(&str, &str, &str); 9] = [
         "/mode [read|edit]",
         "show or set what a plain conversation may do",
     ),
+    (
+        "crashes",
+        "/crashes",
+        "list recent crash reports with their issue links",
+    ),
+    (
+        "crash-reports",
+        "/crash-reports [ask|always|never]",
+        "show or set whether crash reports are filed as GitHub issues",
+    ),
     ("clear", "/clear", "start a new conversation"),
     ("quit", "/quit", "exit"),
 ];
@@ -44,6 +54,8 @@ pub enum Command {
     Model(Option<String>),
     Effort(Option<String>),
     Mode(Option<String>),
+    Crashes,
+    CrashReports(Option<String>),
     Clear,
     Quit,
 }
@@ -64,7 +76,7 @@ pub fn parse(input: &str) -> Result<Input, String> {
     let (name, arg) = rest
         .split_once(char::is_whitespace)
         .map_or((rest, ""), |(n, a)| (n, a.trim()));
-    if !name.chars().all(|c| c.is_ascii_alphabetic()) {
+    if !name.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
         return Ok(Input::Message(input.to_string()));
     }
     let opt = || (!arg.is_empty()).then(|| arg.to_string());
@@ -93,6 +105,8 @@ pub fn parse(input: &str) -> Result<Input, String> {
         "model" => Command::Model(opt()),
         "effort" => Command::Effort(opt()),
         "mode" => Command::Mode(opt()),
+        "crashes" => Command::Crashes,
+        "crash-reports" => Command::CrashReports(opt()),
         "clear" => Command::Clear,
         "quit" | "exit" => Command::Quit,
         _ => {
@@ -234,6 +248,12 @@ mod tests {
         assert_eq!(cmd("/effort high"), Effort(Some("high".into())));
         assert_eq!(cmd("/mode edit"), Mode(Some("edit".into())));
         assert_eq!(cmd("/clear"), Clear);
+        assert_eq!(cmd("/crashes"), Crashes);
+        assert_eq!(cmd("/crash-reports"), CrashReports(None));
+        assert_eq!(
+            cmd("/crash-reports never"),
+            CrashReports(Some("never".into()))
+        );
         assert_eq!(cmd("/QUIT"), Quit);
     }
 

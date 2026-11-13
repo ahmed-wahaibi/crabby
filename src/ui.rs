@@ -227,7 +227,7 @@ pub fn draw(f: &mut Frame, st: &State) {
     // Keep the cursor's row inside the box.
     let top = (cursor_row + 1).saturating_sub(shown_rows);
 
-    let menu = if st.confirm.is_none() && !st.input.contains('\n') {
+    let menu = if !st.asking() && !st.input.contains('\n') {
         commands::matching(&st.input)
     } else {
         vec![]
@@ -280,6 +280,8 @@ pub fn draw(f: &mut Frame, st: &State) {
     let body: Vec<Line> = if st.input.is_empty() {
         let hint = if st.confirm.is_some() {
             "type yes to confirm"
+        } else if st.asking() {
+            "type your answer to the question above (Esc skips)"
         } else {
             "Message or /command"
         };
