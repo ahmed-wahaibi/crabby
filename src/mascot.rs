@@ -51,5 +51,7 @@ pub fn lines() -> Vec<Line<'static>> {
 
 /// Whether the terminal says it draws 24-bit colour.
 pub fn truecolor() -> bool {
+    // Windows Terminal draws 24-bit colour but does not always set COLORTERM; it does set WT_SESSION.
     std::env::var("COLORTERM").is_ok_and(|v| v == "truecolor" || v == "24bit")
+        || std::env::var_os("WT_SESSION").is_some()
 }
