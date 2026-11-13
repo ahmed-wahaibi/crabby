@@ -28,6 +28,8 @@ cargo test
 
 Running anything for real (a message or `/run` in the chat, or `crabby -p …`) needs [Claude Code](https://claude.com/claude-code) installed and signed in, and spends tokens on your account. The unit tests do not. The chat itself needs a real terminal; its logic and drawing are tested without one (a pure `update` function in `app` and drawing to ratatui's test backend in `ui`). Try the screen by hand before changing it.
 
+**Crash handling without a real crash.** Set `CRABBY_HOME` to a temporary folder first: tests and experiments must never write into your real `~/.crabby`. `CRABBY_TEST_PANIC=print|loop|draw|job` makes Crabby panic on purpose at that place (`print` works with `crabby -p`, the others need the chat). `CRABBY_FILING=dry-run` writes issues and comments to a file in that folder instead of GitHub. Never file test crashes in the real repository.
+
 ## Rules for a change
 
 1. **Keep it small.** One pull request does one thing. Prefer the smallest change that fully solves the problem, and reuse what is already in the codebase or the standard library before adding a dependency.
@@ -59,7 +61,7 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org/):
 | `ci` | continuous integration |
 | `chore` | anything else that does not touch source or tests |
 
-Scopes in use: `cli`, `run`, `runner`, `router`, `catalog`, `outcome`, `github`, `chat`.
+Scopes in use: `cli`, `run`, `runner`, `router`, `catalog`, `outcome`, `github`, `chat`, `crash`.
 
 Examples:
 
