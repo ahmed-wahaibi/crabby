@@ -1,5 +1,6 @@
 mod catalog;
 mod outcome;
+mod router;
 mod runner;
 
 use catalog::Agent;
@@ -21,6 +22,8 @@ Examples:
   crabby run sc-code-reviewer - < task.md
   crabby run sc-debugger \"find the flaky test\" --model opus --effort high
   crabby run sc-cloud-architect \"sketch the queue\" --model fable --effort max
+  crabby plan \"add rate limiting to the upload endpoint and cover it with tests\"
+  crabby plan --json \"fix the flaky login test\" --router-model sonnet
 
 Effort ceiling: a run on Fable (`fable` or `claude-fable-*`) is capped at `medium`,
 and without `--effort` it is passed `--effort medium`. Asking for more stops before `claude` starts and asks you to type `yes`; any other
@@ -77,6 +80,25 @@ enum Cmd {
         /// Reasoning effort. On Fable, above `medium` needs a typed `yes` (see `crabby --help`)
         #[arg(long, value_enum)]
         effort: Option<Effort>,
+    },
+    /// Choose agents for a task and print the plan; nothing is run
+    ///
+    /// A small model reads the agent list and the task and answers with steps:
+    /// agent, model, effort, dependencies and instruction. It runs as a tool-less
+    /// `claude` call and costs one short call (see the usage line on stderr).
+    Plan {
+        /// What needs doing. Quote it
+        #[arg(required = true)]
+        task: Vec<String>,
+        /// Print the plan as JSON on stdout
+        #[arg(long)]
+        json: bool,
+        /// Model that makes the plan
+        #[arg(long, default_value = "haiku")]
+        router_model: String,
+        /// Effort of the planning call
+        #[arg(long, value_enum, default_value = "low")]
+        router_effort: Effort,
     },
 }
 
@@ -291,6 +313,39 @@ fn main() -> ExitCode {
             let _ = stdout
                 .lock()
                 .write_all(render_list(&shown, width).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Cmd::Plan {
+            task,
+            json,
+            router_model,
+            router_effort,
+        } => {
+            let task = task.join(" ");
+            if task.trim().is_empty() {
+                return fail("the task is empty; say what needs doing");
+            }
+            // Never prompt here: a router on Fable is capped at medium.
+            let effort = match gate(Some(&router_model), Some(router_effort), false) {
+                Gate::CapToMedium => Effort::Medium,
+                _ => router_effort,
+            };
+            if io::stderr().is_terminal() {
+                eprintln!("crabby: planning via {router_model}...");
+            }
+            let (plan, usage) = match router::plan(&agents, &task, &router_model, &effort.name()) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
+            let text = if json {
+                router::to_json(&plan)
+                    + "
+"
+            } else {
+                router::render(&plan)
+            };
+            let _ = io::stdout().lock().write_all(text.as_bytes());
+            eprintln!("{}", summary(&usage, Some(effort)));
             ExitCode::SUCCESS
         }
         Cmd::Run {

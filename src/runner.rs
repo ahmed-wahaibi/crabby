@@ -45,7 +45,7 @@ pub fn run(
     task: &str,
     model: Option<&str>,
     effort: Option<&str>,
-    mut on_event: impl FnMut(Event),
+    on_event: impl FnMut(Event),
 ) -> io::Result<(String, Option<Usage>)> {
     let tools = agent.tools.join(",");
     // A `claude.cmd` install goes through cmd.exe, which cannot take a line break.
@@ -70,6 +70,54 @@ pub fn run(
     if let Some(e) = effort {
         cmd.args(["--effort", e]);
     }
+    stream(cmd, task, on_event)
+}
+
+/// One tool-less `claude` call with its own system prompt instead of Claude Code's
+/// default (about 40k tokens). Returns the answer and its usage.
+///
+/// `--system-prompt` and `--tools ""` alone still leave plugins, skills and MCP
+/// servers in the prompt, so the call also skips settings, slash commands and MCP.
+pub fn ask(
+    system: &str,
+    prompt: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> io::Result<(String, Option<Usage>)> {
+    if model.is_some_and(|m| m.contains(['\n', '\r'])) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the model name must not contain line breaks",
+        ));
+    }
+    let file = TempFile::new(system)
+        .map_err(|e| io::Error::new(e.kind(), format!("could not save the system prompt: {e}")))?;
+    let mut cmd = Command::new(claude_program());
+    cmd.args(["--print", "--output-format", "stream-json", "--verbose"])
+        .arg("--system-prompt-file")
+        .arg(&file.0)
+        .args([
+            "--tools",
+            "",
+            "--no-session-persistence",
+            "--disable-slash-commands",
+        ])
+        .args(["--strict-mcp-config", "--setting-sources", ""]);
+    if let Some(m) = model {
+        cmd.args(["--model", m]);
+    }
+    if let Some(e) = effort {
+        cmd.args(["--effort", e]);
+    }
+    stream(cmd, prompt, |_| {})
+}
+
+/// Feeds `task` to `cmd` and collects the final message and usage from its stream.
+fn stream(
+    cmd: Command,
+    task: &str,
+    mut on_event: impl FnMut(Event),
+) -> io::Result<(String, Option<Usage>)> {
     let (mut result, mut usage) = (None, None);
     feed(cmd, task, |line| {
         read_line(line, &mut on_event, &mut result, &mut usage)
