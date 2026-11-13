@@ -140,13 +140,29 @@ Starting defaults (changeable in config). With the effort judge on, the effort c
 
 Caveman's own "Auto" feature also picks model and effort. Crabby leaves that to the router and the effort judge in section 3, so the two do not compete.
 
-## 8. Terminal interface
+## 8. Terminal interface and slash commands
+
+Running `crabby` with no arguments opens a chat that works the way Claude Code's does: a prompt at the bottom, replies streaming above it, tool activity shown inline, and slash commands. A plain message is an ordinary single-assistant conversation. Orchestration is something you ask for with a command, not the default. The look, name and mascot are Crabby's own.
 
 | Feature | Status |
 |---|---|
-| Three-pane layout: plan with a status per step, live output of the selected agent, input line | planned |
+| Chat interface: prompt line, streaming replies, inline tool activity, multi-line input, history with the arrow keys | planned |
+| A plain message goes to one Claude Code session in the current project, with no router and no extra agents | planned |
+| Conversation kept across messages and resumable after restart | planned |
+| `/` opens a command list with completion; `/help` describes each command | planned |
+| **`/orchestrate <task>`**: the router picks agents and drafts a plan, you approve it, and the agents run (sections 4 and 5) | planned |
+| **`/create-issue <description>`**: drafts a GitHub issue for the current project (title, body, labels, taken from your description and the repo), shows it to you, and creates it once you approve | planned |
+| **`/docs [what]`**: brings the project's documentation in line with the code, for everything or only what you name, and shows the changes before they are kept | planned |
+| **`/review <PR links…>`**: reviews the pull requests whose links you append | planned |
+| **`/review all`**: reviews every open pull request in the current project | planned |
+| **`/review <description>`**: you describe the pull request in words and Crabby finds the matching one, asking when more than one fits | planned |
+| Reviews list findings by severity with file and line; posting them to the pull request as a comment happens only when you approve | planned |
+| `/agents` to browse the catalogue, `/run <agent> <task>` for one agent | planned |
+| `/model`, `/effort`, `/memory`, `/cost` and `/clear` | planned |
+| Every command also works from the shell, e.g. `crabby review all`, for scripts and CI | planned |
+| During `/orchestrate`: a plan panel with a status per step beside the live output of the selected agent | planned |
 | Switch between running agents with the arrow keys | planned |
-| Status bar: agents running, tokens, cost so far | planned |
+| Status bar: model, effort, agents running, tokens, cost so far | planned |
 | Model and effort shown per step | planned |
 | Scrollback and search within an agent's output | planned |
 | Stop one agent or the whole run from the keyboard | planned |
