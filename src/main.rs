@@ -22,8 +22,8 @@ Examples:
   crabby run sc-debugger \"find the flaky test\" --model opus --effort high
   crabby run sc-cloud-architect \"sketch the queue\" --model fable --effort max
 
-Effort ceiling: a run on Fable (`fable` or `claude-fable-*`) is capped at `medium`.
-Asking for more stops before `claude` starts and asks you to type `yes`; any other
+Effort ceiling: a run on Fable (`fable` or `claude-fable-*`) is capped at `medium`,
+and without `--effort` it is passed `--effort medium`. Asking for more stops before `claude` starts and asks you to type `yes`; any other
 answer, or no terminal to ask on, runs at `medium`. Without `--model` crabby reads
 the model from ANTHROPIC_MODEL or Claude Code's settings files, and if it cannot
 tell, it treats the run as possibly Fable.
@@ -103,6 +103,8 @@ enum Gate {
     Proceed,
     Ask,
     CapToMedium,
+    /// Possibly Fable with no `--effort`: pass `medium` instead of Claude Code's default.
+    DefaultMedium,
 }
 
 /// Decides whether a run may start at the requested effort. `model` is `None` when
@@ -112,13 +114,54 @@ fn gate(model: Option<&str>, effort: Option<Effort>, terminal: bool) -> Gate {
         let m = m.trim().to_ascii_lowercase();
         m == "fable" || m.starts_with("claude-fable")
     });
-    if !fable || effort.is_none_or(|e| e <= Effort::Medium) {
-        Gate::Proceed
-    } else if terminal {
-        Gate::Ask
-    } else {
-        Gate::CapToMedium
+    match effort {
+        _ if !fable => Gate::Proceed,
+        None => Gate::DefaultMedium,
+        Some(e) if e <= Effort::Medium => Gate::Proceed,
+        Some(_) if terminal => Gate::Ask,
+        Some(_) => Gate::CapToMedium,
     }
+}
+
+/// `1234567` -> `1,234,567`.
+fn commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The one-line run summary for stderr.
+fn summary(u: &runner::Usage, effort: Option<Effort>) -> String {
+    let mut parts = vec!["crabby:".to_string()];
+    if !u.models.is_empty() {
+        parts.push(u.models.join(", "));
+        parts.push("·".into());
+    }
+    parts.push(format!(
+        "effort {} · {} in / {} out",
+        effort.map_or("default".into(), Effort::name),
+        commas(u.input_tokens),
+        commas(u.output_tokens)
+    ));
+    if u.cache_read_tokens > 0 {
+        parts.push(format!("· {} cached", commas(u.cache_read_tokens)));
+    }
+    if u.cache_write_tokens > 0 {
+        parts.push(format!("· {} written", commas(u.cache_write_tokens)));
+    }
+    if let Some(c) = u.cost_usd {
+        parts.push(format!("· ${c:.4}"));
+    }
+    if let Some(ms) = u.duration_ms {
+        parts.push(format!("· {}s", (ms + 500) / 1000));
+    }
+    parts.join(" ")
 }
 
 /// The model Claude Code would use when `--model` is not given: ANTHROPIC_MODEL, else
@@ -297,6 +340,7 @@ fn main() -> ExitCode {
                     eprintln!("crabby: no terminal to ask on, so this runs at medium effort (Fable ceiling)");
                     Some(Effort::Medium)
                 }
+                (Gate::DefaultMedium, _) => Some(Effort::Medium),
                 _ => effort,
             };
             if io::stderr().is_terminal() {
@@ -320,7 +364,7 @@ fn main() -> ExitCode {
                     eprintln!("crabby: {name} {arg}");
                 }
             };
-            let output = match runner::run(
+            let (output, usage) = match runner::run(
                 agent,
                 &task,
                 model.as_deref(),
@@ -330,6 +374,9 @@ fn main() -> ExitCode {
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
+            if let Some(u) = &usage {
+                eprintln!("{}", summary(u, effort));
+            }
             match outcome::parse(&output).and_then(|o| o.status) {
                 Some(Status::Done) => ExitCode::SUCCESS,
                 Some(Status::Partial) => ExitCode::from(1),
@@ -367,7 +414,7 @@ mod tests {
         // Not Fable, or nothing above medium asked for: go.
         assert_eq!(g(Some("opus"), Some(Max), true), Gate::Proceed);
         assert_eq!(g(Some("claude-opus-5-5"), Some(High), false), Gate::Proceed);
-        assert_eq!(g(Some("fable"), None, true), Gate::Proceed);
+        assert_eq!(g(Some("opus"), None, true), Gate::Proceed);
         assert_eq!(g(Some("fable"), Some(Low), false), Gate::Proceed);
         assert_eq!(g(Some("fable"), Some(Medium), false), Gate::Proceed);
         assert_eq!(g(None, Some(Medium), false), Gate::Proceed);
@@ -380,9 +427,37 @@ mod tests {
         assert_eq!(g(Some("Claude-FABLE-5-2"), Some(High), true), Gate::Ask);
         assert_eq!(g(Some("FABLE"), Some(High), false), Gate::CapToMedium);
         assert_eq!(g(Some("my-fable"), Some(High), true), Gate::Proceed);
+        // Fable or unknown with no effort: pass medium explicitly, no prompt.
+        assert_eq!(g(Some("fable"), None, true), Gate::DefaultMedium);
+        assert_eq!(
+            g(Some("claude-fable-5-2"), None, false),
+            Gate::DefaultMedium
+        );
+        assert_eq!(g(None, None, true), Gate::DefaultMedium);
         // Unknown model counts as possibly Fable.
         assert_eq!(g(None, Some(High), true), Gate::Ask);
         assert_eq!(g(None, Some(Max), false), Gate::CapToMedium);
+    }
+
+    #[test]
+    fn summary_line_shows_what_the_event_gave() {
+        let u = runner::Usage {
+            input_tokens: 1204,
+            output_tokens: 310,
+            cache_read_tokens: 18400,
+            cost_usd: Some(0.00312),
+            duration_ms: Some(11600),
+            models: vec!["claude-haiku-5-5".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(&u, Some(Effort::Low)),
+            "crabby: claude-haiku-5-5 · effort low · 1,204 in / 310 out · 18,400 cached · $0.0031 · 12s"
+        );
+        assert_eq!(
+            summary(&runner::Usage::default(), None),
+            "crabby: effort default · 0 in / 0 out"
+        );
     }
 
     #[test]

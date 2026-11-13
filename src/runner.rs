@@ -20,8 +20,22 @@ pub enum Event {
     Tool { name: String, arg: String },
 }
 
+/// What the final `result` event of a run reports. Fields the event lacks stay 0 / `None`.
+#[derive(Debug, Default, PartialEq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub duration_ms: Option<u64>,
+    /// Exact model ids that ran (from `modelUsage`), sorted.
+    pub models: Vec<String>,
+}
+
 /// Runs `agent` on `task` in the current directory, hands each [`Event`] to
-/// `on_event` as it arrives and returns the agent's final message.
+/// `on_event` as it arrives and returns the agent's final message and its usage
+/// (`None` when no result event carried any).
 ///
 /// The agent's file becomes extra system instructions, and only the tools named in
 /// its header are pre-approved: a headless run cannot ask for permission, so any
@@ -32,7 +46,7 @@ pub fn run(
     model: Option<&str>,
     effort: Option<&str>,
     mut on_event: impl FnMut(Event),
-) -> io::Result<String> {
+) -> io::Result<(String, Option<Usage>)> {
     let tools = agent.tools.join(",");
     // A `claude.cmd` install goes through cmd.exe, which cannot take a line break.
     let has_break = |s: &str| s.contains(['\n', '\r']);
@@ -56,15 +70,15 @@ pub fn run(
     if let Some(e) = effort {
         cmd.args(["--effort", e]);
     }
-    let mut result = None;
+    let (mut result, mut usage) = (None, None);
     feed(cmd, task, |line| {
-        read_line(line, &mut on_event, &mut result)
+        read_line(line, &mut on_event, &mut result, &mut usage)
     })
     .map_err(|e| match &result {
         Some(text) => io::Error::new(e.kind(), format!("{e}\n{text}")),
         None => e,
     })?;
-    Ok(result.unwrap_or_default())
+    Ok((result.unwrap_or_default(), usage))
 }
 
 /// A file in the temp directory, deleted when dropped.
@@ -113,8 +127,14 @@ fn find_on_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
 }
 
 /// Handles one line of `claude --output-format stream-json`: events go to
-/// `on_event`, the final message into `result`. Anything else is skipped.
-fn read_line(line: &str, on_event: &mut impl FnMut(Event), result: &mut Option<String>) {
+/// `on_event`, the final message into `result`, its usage into `usage`. Anything else
+/// is skipped.
+fn read_line(
+    line: &str,
+    on_event: &mut impl FnMut(Event),
+    result: &mut Option<String>,
+    usage: &mut Option<Usage>,
+) {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return;
     };
@@ -134,6 +154,23 @@ fn read_line(line: &str, on_event: &mut impl FnMut(Event), result: &mut Option<S
         Some("result") => {
             if let Some(text) = v["result"].as_str() {
                 *result = Some(text.to_string());
+            }
+            if let Some(u) = v["usage"].as_object() {
+                let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+                let mut models: Vec<String> = v["modelUsage"]
+                    .as_object()
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                models.sort();
+                *usage = Some(Usage {
+                    input_tokens: n("input_tokens"),
+                    output_tokens: n("output_tokens"),
+                    cache_read_tokens: n("cache_read_input_tokens"),
+                    cache_write_tokens: n("cache_creation_input_tokens"),
+                    cost_usd: v["total_cost_usd"].as_f64(),
+                    duration_ms: v["duration_ms"].as_u64(),
+                    models,
+                });
             }
         }
         _ => {}
@@ -246,10 +283,11 @@ not json at all
 [1, 2
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"It says hello."}]},"parent_tool_use_id":null}
 {"duration_ms":7568,"is_error":false,"subtype":"success","result":"It says hello.","type":"result"}"#;
-        let (mut events, mut result) = (Vec::new(), None);
+        let (mut events, mut result, mut usage) = (Vec::new(), None, None);
         for line in stream.lines() {
-            read_line(line, &mut |e| events.push(e), &mut result);
+            read_line(line, &mut |e| events.push(e), &mut result, &mut usage);
         }
+        assert_eq!(usage, None); // that result event has no usage block
         let tool = |name: &str, arg: &str| Event::Tool {
             name: name.into(),
             arg: arg.into(),
@@ -263,6 +301,37 @@ not json at all
             ]
         );
         assert_eq!(result.as_deref(), Some("It says hello."));
+    }
+
+    #[test]
+    fn usage_is_read_from_the_result_event() {
+        // Captured from claude, cut down to the fields that matter.
+        let real = r#"{"total_cost_usd":0.004165380000000001,"usage":{"input_tokens":2,"cache_creation_input_tokens":19796,"cache_read_input_tokens":16548,"output_tokens":81},"modelUsage":{"claude-haiku-5-5":{"inputTokens":2}},"is_error":false,"result":"Hi!","type":"result","duration_ms":3290}"#;
+        let (mut result, mut usage) = (None, None);
+        read_line(real, &mut |_| {}, &mut result, &mut usage);
+        assert_eq!(
+            usage,
+            Some(Usage {
+                input_tokens: 2,
+                output_tokens: 81,
+                cache_read_tokens: 16548,
+                cache_write_tokens: 19796,
+                cost_usd: Some(0.004165380000000001),
+                duration_ms: Some(3290),
+                models: vec!["claude-haiku-5-5".into()],
+            })
+        );
+        // Fields missing: zeros and `None`, no panic.
+        usage = None;
+        let sparse = r#"{"type":"result","result":"x","usage":{"output_tokens":5}}"#;
+        read_line(sparse, &mut |_| {}, &mut result, &mut usage);
+        assert_eq!(
+            usage,
+            Some(Usage {
+                output_tokens: 5,
+                ..Usage::default()
+            })
+        );
     }
 
     #[test]
