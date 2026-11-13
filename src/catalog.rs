@@ -17,15 +17,18 @@ pub struct Agent {
 
 /// Parses one agent file. `stem` is the file name without `.md`.
 pub fn parse(stem: &str, text: &str) -> Result<Agent, String> {
-    let text = text.replace("\r\n", "\n");
+    // Editors on Windows may save a byte-order mark in front of the first `---`.
+    let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     let rest = text.strip_prefix("---\n").ok_or("missing frontmatter")?;
-    let (header, body) = rest.split_once("\n---\n").ok_or("unterminated frontmatter")?;
+    let (header, body) = rest
+        .split_once("\n---\n")
+        .ok_or("unterminated frontmatter")?;
 
     let field = |key: &str| -> Result<String, String> {
         header
             .lines()
             .find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))
-            .map(|v| v.trim().trim_matches('"').to_string())
+            .map(|v| unquote(v.trim()).to_string())
             .filter(|v| !v.is_empty())
             .ok_or(format!("missing `{key}`"))
     };
@@ -41,44 +44,72 @@ pub fn parse(stem: &str, text: &str) -> Result<Agent, String> {
         name,
         description: field("description")?,
         category: field("category")?,
-        tools: field("tools")?.split(',').map(|t| t.trim().to_string()).collect(),
+        tools: field("tools")?
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
         body: body.trim().to_string(),
     })
+}
+
+/// Strips one pair of matching quotes, leaving quotes inside the value alone.
+fn unquote(v: &str) -> &str {
+    ['"', '\'']
+        .iter()
+        .find_map(|&q| v.strip_prefix(q)?.strip_suffix(q))
+        .unwrap_or(v)
+}
+
+fn is_md(p: &Path) -> bool {
+    p.extension().and_then(|e| e.to_str()) == Some("md")
 }
 
 /// Loads the built-in agents, or those under `dir` (a `categories` folder) when given.
 /// Invalid files are skipped and reported in the second value.
 pub fn load(dir: Option<&Path>) -> (Vec<Agent>, Vec<String>) {
     let mut files: Vec<(String, String)> = Vec::new(); // (path, text)
+    let (mut agents, mut warnings): (Vec<Agent>, Vec<String>) = (Vec::new(), Vec::new());
     match dir {
         None => {
-            for cat in EMBEDDED.dirs() {
-                for f in cat.files() {
-                    if let Some(t) = f.contents_utf8() {
-                        files.push((f.path().display().to_string(), t.to_string()));
-                    }
+            for f in EMBEDDED
+                .dirs()
+                .flat_map(|cat| cat.files())
+                .filter(|f| is_md(f.path()))
+            {
+                let path = f.path().display().to_string();
+                match f.contents_utf8() {
+                    Some(t) => files.push((path, t.to_string())),
+                    None => warnings.push(format!("{path}: not valid UTF-8")),
                 }
             }
         }
         Some(root) => {
             for cat in fs::read_dir(root).into_iter().flatten().flatten() {
                 for f in fs::read_dir(cat.path()).into_iter().flatten().flatten() {
-                    if let Ok(t) = fs::read_to_string(f.path()) {
-                        files.push((f.path().display().to_string(), t));
+                    let path = f.path();
+                    if !is_md(&path) {
+                        continue;
+                    }
+                    match fs::read_to_string(&path) {
+                        Ok(t) => files.push((path.display().to_string(), t)),
+                        Err(e) => warnings.push(format!("{}: {e}", path.display())),
                     }
                 }
             }
         }
     }
 
-    let (mut agents, mut warnings) = (Vec::new(), Vec::new());
     for (path, text) in files {
-        let p = Path::new(&path);
-        if p.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let stem = Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
         match parse(stem, &text) {
+            // `run` picks an agent by name, so a second one could never be reached.
+            Ok(a) if agents.iter().any(|b| b.name == a.name) => {
+                warnings.push(format!("{path}: duplicate agent name `{}`", a.name))
+            }
             Ok(a) => agents.push(a),
             Err(e) => warnings.push(format!("{path}: {e}")),
         }
@@ -107,6 +138,53 @@ mod tests {
         assert!(parse("other", GOOD).is_err()); // name mismatch
         assert!(parse("sc-x", &GOOD.replace("## Result", "")).is_err());
         assert!(parse("sc-x", "no frontmatter").is_err());
+    }
+
+    #[test]
+    fn frontmatter_edge_cases() {
+        // A key that is a prefix of another key must not match the longer one.
+        let a = parse(
+            "sc-x",
+            &GOOD.replace("name: sc-x", "names: wrong\nname: sc-x"),
+        )
+        .unwrap();
+        assert_eq!(a.name, "sc-x");
+        assert!(parse("sc-x", &GOOD.replace("name: sc-x", "names: sc-x")).is_err());
+
+        // One pair of quotes comes off; quotes and colons inside the value stay.
+        let quoted = |d: &str| {
+            parse("sc-x", &GOOD.replace("Does x.", d))
+                .unwrap()
+                .description
+        };
+        assert_eq!(
+            quoted(r#""Use for: the "big" jobs""#),
+            r#"Use for: the "big" jobs"#
+        );
+        assert_eq!(quoted("'single'"), "single");
+        assert_eq!(quoted(r#"say "hi""#), r#"say "hi""#);
+
+        // Byte-order mark in front, empty entries in the tool list.
+        let text = format!("\u{feff}{}", GOOD.replace("Read, Grep", "Read,, Grep,"));
+        assert_eq!(parse("sc-x", &text).unwrap().tools, ["Read", "Grep"]);
+
+        assert!(parse("sc-x", &GOOD.replace("Does x.", "\"\"")).is_err()); // empty value
+        assert!(parse("sc-x", "---\nname: sc-x\n").is_err()); // unterminated
+    }
+
+    #[test]
+    fn load_reports_duplicates_and_unreadable_files() {
+        let root = std::env::temp_dir().join(format!("crabby-test-{}", std::process::id()));
+        for cat in ["01-a", "02-b"] {
+            fs::create_dir_all(root.join(cat)).unwrap();
+            fs::write(root.join(cat).join("sc-x.md"), GOOD).unwrap();
+        }
+        fs::write(root.join("01-a/sc-bin.md"), [0xff, 0xfe]).unwrap();
+        fs::write(root.join("01-a/notes.txt"), "ignored").unwrap();
+        let (agents, warnings) = load(Some(&root));
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
     }
 
     #[test]

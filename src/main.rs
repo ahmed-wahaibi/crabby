@@ -134,8 +134,10 @@ fn main() -> ExitCode {
 
     match cli.command {
         Cmd::List { category } => {
-            let shown: Vec<&Agent> =
-                agents.iter().filter(|a| category.as_ref().is_none_or(|c| *c == a.category)).collect();
+            let shown: Vec<&Agent> = agents
+                .iter()
+                .filter(|a| category.as_ref().is_none_or(|c| *c == a.category))
+                .collect();
             if shown.is_empty() {
                 let mut cats: Vec<&str> = agents.iter().map(|a| a.category.as_str()).collect();
                 cats.dedup();
@@ -150,7 +152,9 @@ fn main() -> ExitCode {
                 .is_terminal()
                 .then(|| terminal_size::terminal_size().map_or(80, |(w, _)| w.0 as usize));
             // One write, error ignored: `crabby list | head` must not panic on a closed pipe.
-            let _ = stdout.lock().write_all(render_list(&shown, width).as_bytes());
+            let _ = stdout
+                .lock()
+                .write_all(render_list(&shown, width).as_bytes());
             ExitCode::SUCCESS
         }
         Cmd::Run { agent, task, model } => {
@@ -165,7 +169,10 @@ fn main() -> ExitCode {
                 return fail(if near.is_empty() {
                     format!("no agent named `{agent}`; run `crabby list` to see the names")
                 } else {
-                    format!("no agent named `{agent}`; did you mean: {}", near.join(", "))
+                    format!(
+                        "no agent named `{agent}`; did you mean: {}",
+                        near.join(", ")
+                    )
                 });
             };
             let task = if task == ["-"] {
@@ -181,7 +188,10 @@ fn main() -> ExitCode {
                 return fail("the task is empty; say what the agent should do");
             }
             if io::stderr().is_terminal() {
-                eprintln!("crabby: running {} via claude, this can take a few minutes...", agent.name);
+                eprintln!(
+                    "crabby: running {} via claude, this can take a few minutes...",
+                    agent.name
+                );
             }
             let output = match runner::run(agent, &task, model.as_deref()) {
                 Ok(o) => o,
@@ -224,13 +234,22 @@ mod tests {
         let (a, b) = (agent("sc-a", "one", "Short."), agent("sc-bb", "two", &long));
         let agents = [&a, &b];
 
-        assert_eq!(render_list(&agents, None), format!("sc-a\tone\tShort.\nsc-bb\ttwo\t{long}\n"));
+        assert_eq!(
+            render_list(&agents, None),
+            format!("sc-a\tone\tShort.\nsc-bb\ttwo\t{long}\n")
+        );
 
         let wide = render_list(&agents, Some(60));
-        assert!(wide.starts_with("one\n  sc-a   Short.\n\ntwo\n  sc-bb  xxx"), "{wide}");
+        assert!(
+            wide.starts_with("one\n  sc-a   Short.\n\ntwo\n  sc-bb  xxx"),
+            "{wide}"
+        );
         assert!(wide.lines().all(|l| l.chars().count() < 60), "{wide}");
         assert!(wide.trim_end().ends_with('…'));
 
-        assert_eq!(render_list(&agents, Some(20)), "one\n  sc-a\n\ntwo\n  sc-bb\n");
+        assert_eq!(
+            render_list(&agents, Some(20)),
+            "one\n  sc-a\n\ntwo\n  sc-bb\n"
+        );
     }
 }
