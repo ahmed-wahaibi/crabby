@@ -7,12 +7,13 @@ Crabby is at an early stage. The chat, running a single agent and planning which
 ## What works today
 
 - **A chat in your terminal.** Run `crabby`: a transcript, an input box and a status line. A plain message is a conversation with one Claude Code session in the current folder; replies stream in, tool calls show as dim one-line entries, and follow-ups continue the same conversation.
-- **Slash commands** for everything else: `/agents`, `/run`, `/plan`, `/model`, `/effort`, `/mode`, `/clear`, `/help`, `/quit`. Typing `/` lists them and Tab completes.
+- **Slash commands** for everything else: `/agents`, `/run`, `/plan`, `/model`, `/effort`, `/mode`, `/crashes`, `/crash-reports`, `/clear`, `/help`, `/quit`. Typing `/` lists them and Tab completes.
 - **152 built-in agents** from [sc-agents](https://github.com/ahmed-wahaibi/sc-agents), compiled into one binary. Nothing to download at run time.
 - **Run any agent on a task** with `/run`, as a headless Claude Code session limited to the tools that agent declares.
 - **Plan with `/plan`:** a small model picks the agents for a task and shows the plan. Nothing is executed.
 - **Model and effort** with `/model` and `/effort`, with a ceiling that asks you to type `yes` before running Fable above medium effort.
 - **Token and cost summary:** a running total in the status line, and an exact line after every `/run` and `/plan`.
+- **Crash recovery.** If Crabby or a task dies, the next start offers to restore the conversation and your unsent text, and to resume, rerun or discard each interrupted task. Nothing runs unless you choose it. See [Crashes and recovery](#crashes-and-recovery).
 - **Script-friendly:** `crabby -p "<message or /command>"` runs one input without the interface, and the exit code reflects what an agent reported.
 
 ## Requirements
@@ -39,6 +40,8 @@ Run `crabby` in the folder you want to work on. It needs a real terminal at leas
 | `/model [name]` | shows or sets the model for messages and `/run` |
 | `/effort [level]` | shows or sets the effort (`low`, `medium`, `high`, `xhigh`, `max`, `default`) |
 | `/mode [read\|edit]` | shows or sets what a plain conversation may do |
+| `/crashes` | lists recent crash reports with their issue links |
+| `/crash-reports [ask\|always\|never]` | shows or sets whether crash reports are filed as GitHub issues |
 | `/clear` | starts a new conversation and clears the transcript |
 | `/quit` | exits |
 
@@ -85,8 +88,21 @@ Without `-p`, Crabby refuses to start unless both stdin and stdout are a termina
 | 1 | `/run`: the agent reported `partial` |
 | 2 | `/run`: the agent reported `blocked` |
 | 3 | `/run`: the agent finished without a result block |
-| 4 | Crabby could not do it (unknown agent, `claude` missing or failed) |
+| 4 | Crabby could not do it (unknown agent, `claude` missing or failed, or Crabby crashed; a crash writes a report and never prompts) |
 | 64 | usage error (bad flag, unknown command, or no terminal and no `-p`) |
+
+## Crashes and recovery
+
+Crabby keeps a small journal in `~/.crabby` (set `CRABBY_HOME` to move it), outside every project. Each task is recorded before it starts; a conversation and your unsent text are saved while you chat. If Crabby is killed, the window is closed or a task dies, the next start says so in one line and asks, one question at a time:
+
+- the conversation: `yes` restores the transcript and unsent text, and your next message continues the same session;
+- each interrupted task: `resume` (continue the same Claude session, when there is one), `again` (from the start) or `discard`. A resumed task is subject to the Fable effort ceiling like any other. If Claude Code no longer has the session, Crabby says so and offers `again`.
+
+Esc skips the questions; they are asked again at the next start. After three failed start-ups in a row Crabby skips recovery, says so, and deletes nothing.
+
+**Crash reports.** A panic, or a `claude` process that exits abnormally, is killed or prints nothing for 15 minutes, writes `~/.crabby/crashes/<id>.md`: what happened and where, what Crabby was doing (never your task text), versions, OS, terminal and a backtrace, plus a short analysis from one Haiku call that is labelled a guess. Your home folder and user name are replaced and anything that looks like a key or token is removed. Known causes (`claude` missing, signed out, rate limit, no network) and stopping a reply are not crashes.
+
+With `gh` installed and signed in, the report can be filed as an issue labelled `crash` in [ahmed-wahaibi/crabby](https://github.com/ahmed-wahaibi/crabby), with a comment instead of a duplicate when the same crash is already open. The first time, Crabby shows the exact text and asks: `send` this one, `always`, `never` or `skip`. Change it any time with `/crash-reports ask|always|never`. With `never` nothing is analysed and nothing leaves your machine. If `gh` is missing, signed out or offline, the report stays on disk and is offered again at the next start. With `-p` a crash writes the report, exits with code 4 and never asks; it is offered at the next chat.
 
 ## How it works
 

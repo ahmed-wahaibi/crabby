@@ -149,7 +149,7 @@ Running `crabby` with no arguments opens a chat that works the way Claude Code's
 | Chat interface: transcript, input box, status line; streaming replies, inline tool activity, multi-line input (Alt+Enter), history with the arrow keys | built |
 | A plain message goes to one Claude Code session in the current project, with no router and no extra agents | built |
 | Conversation kept across messages (`--resume`) | built |
-| Conversation resumable after restart | planned |
+| Conversation resumable after a crash or kill: transcript, session and unsent input offered back at the next start (section 14) | built |
 | `/mode read\|edit`: what a plain conversation may do, since a headless session cannot ask. `read` pre-approves read and search tools, `edit` also file edits and shell commands | built |
 | `/` opens a command list with completion (Tab); `/help` describes each command | built |
 | **`/orchestrate <task>`**: the router picks agents and drafts a plan, you approve it, and the agents run (sections 4 and 5) | planned |
@@ -161,6 +161,7 @@ Running `crabby` with no arguments opens a chat that works the way Claude Code's
 | Reviews list findings by severity with file and line; posting them to the pull request as a comment happens only when you approve | planned |
 | `/agents` to browse the catalogue, `/run <agent> <task>` for one agent | built |
 | `/model`, `/effort` and `/clear` | built |
+| `/crashes` and `/crash-reports [ask\|always\|never]` (section 14) | built |
 | `/memory` and `/cost` | planned |
 | Where it makes sense, a command also works from the shell with `crabby -p "/command"`, for scripts and CI | built for the commands above, planned for the rest |
 | During `/orchestrate`: a plan panel with a status per step beside the live output of the selected agent | planned |
@@ -193,6 +194,7 @@ Running `crabby` with no arguments opens a chat that works the way Claude Code's
 | Agents never get tools beyond their header, whatever the task says | built |
 | Confirmation prompt before a plan that includes agents with shell access runs in a folder for the first time | planned |
 | Temporary files cleaned up after every run | built (not on Ctrl-C) |
+| Every `claude` child is stopped when Crabby crashes or exits | built |
 
 ## 11. Global memory (never committed)
 
@@ -221,6 +223,33 @@ Rules you tell Crabby to remember are kept in one store on your machine, outside
 | `crabby history` and `crabby resume <id>` to continue a stopped plan from its last finished step | planned |
 | Config file for defaults: model and effort by kind of work, per-agent overrides, parallel limit, spend cap, mascot | planned |
 | Project-level config that overrides the user-level one | planned |
+
+## 14. Crash recovery, task recovery and crash reports
+
+A crash is Crabby panicking, a `claude` process failing underneath it (abnormal exit, killed, or silent for 15 minutes), or Crabby being ended from outside (window closed, killed, power lost). Not crashes: the user stopping a reply, an agent reporting `blocked` or `partial`, a usage error, and known causes (`claude` not installed, signed out, rate limit, no network), which get a clear message instead. Files live in `~/.crabby` (`$CRABBY_HOME` overrides it), never in a project.
+
+| Feature | Status |
+|---|---|
+| Panic hook: stops the `claude` children, restores the terminal (raw mode, alternate screen, bracketed paste, mouse capture, cursor) before anything is printed, saves a report and prints one line with its path; also for a panic while drawing and before the interface exists | built |
+| A panic in a job thread does not take the interface down: the task is marked crashed, the interface stays usable, the crash is reported | built |
+| `-p`: a crash writes the report and exits with code 4; it never prompts | built |
+| Journal `~/.crabby/journal/`: every task (message, `/run`, `/plan`) is recorded before it starts with kind, agent, model, effort, mode, folder, input and Claude session id; marked finished when it ends normally; the last 50 finished entries are kept | built |
+| At the next start, one line says Crabby ended unexpectedly and offers, per interrupted task, **resume** (same Claude session, when there is one), **run again** or **discard**; nothing runs unless chosen | built |
+| A resumed or rerun task goes through the Fable effort ceiling again | built |
+| A session Claude Code no longer has falls back to "run again" and says why | built |
+| The conversation (transcript, session, settings) and the unsent input are saved while chatting and offered back after a crash; a clean exit leaves nothing | built |
+| Two windows at once: each has its own entries; a running task of a live window is never offered | built |
+| A corrupt or half-written journal file is skipped and removed; writes are atomic | built |
+| Three failed start-ups in a row start in a safe state that skips recovery and says so | built |
+| Crash report `~/.crabby/crashes/<id>.md`: what happened, where (panic location, or exit status and the end of the error output), what Crabby was doing (kind, agent, model, effort, never the task text), Crabby version and commit, Claude Code version, OS, terminal, backtrace; the last 100 are kept | built |
+| Analysis section, labelled a guess: one Haiku call at low effort. Tool-less on the report alone; inside a Crabby checkout, `sc-debugger` limited to `Read`, `Grep` and `Glob` | built |
+| Filed with `gh` as an issue labelled `crash` in `ahmed-wahaibi/crabby`; one issue per signature (kind, location or exit status, normalised message), a comment on the open issue for a repeat | built |
+| Privacy: home folder and user name replaced, keys and tokens removed, no file contents, task text, transcript or environment; the exact text is shown before it is sent | built |
+| Consent: send this one, always, or never; stored with the journal; `/crash-reports [ask\|always\|never]`; with `never` no analysis and no network call | built |
+| `gh` missing, signed out or offline: the report stays on disk, Crabby says so, it is offered again at the next start | built |
+| `/crashes`: recent reports with their issue links | built |
+| `CRABBY_FILING=dry-run` writes issues and comments to a file instead of GitHub | built |
+| Recovering a multi-step plan | planned (with `/resume`, section 12) |
 
 ## 13. Distribution
 
