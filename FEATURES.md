@@ -36,7 +36,7 @@ Each agent run gets its own model and its own effort level. Neither is fixed in 
 | Feature | Status |
 |---|---|
 | `--model <name>` on `crabby run` | built |
-| `--effort <low\|medium\|high\|xhigh\|max>` on `crabby run` | planned |
+| `--effort <low\|medium\|high\|xhigh\|max>` on `crabby run` | built |
 | Model accepted as an alias (`fable`, `opus`, `sonnet`, `haiku`) or an exact version (`claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) | planned |
 | Aliases resolved to the exact model version at run time, and the exact version recorded with the run | planned |
 | Router chooses the model for every step of a plan, from the difficulty and risk of that step; the effort judge below picks the effort | planned |
@@ -46,8 +46,8 @@ Each agent run gets its own model and its own effort level. Neither is fixed in 
 | Fallback model per run, used when the chosen model is overloaded or unavailable | planned |
 | Automatic step-up: a step that comes back `blocked` or `partial` can be retried once on a stronger model or higher effort | planned |
 | Model version, effort, tokens and cost stored for every run in the run log | planned |
-| **Fable effort ceiling:** a run on Fable is capped at `medium` effort. Anything higher, whether you asked for it, the judge picked it or a retry stepped it up, stops and asks you to type `yes` first | planned |
-| Any other answer, or no terminal to ask on (scripts, CI, `--yes`), runs the step at `medium` and says so | planned |
+| **Fable effort ceiling:** a run on Fable is capped at `medium` effort. Anything higher, whether you asked for it, the judge picked it or a retry stepped it up, stops and asks you to type `yes` first | built |
+| Any other answer, or no terminal to ask on (scripts, CI, `--yes`), runs the step at `medium` and says so | built |
 | The ceiling applies per step, so approving one step does not approve the next | planned |
 
 ### Effortless: effort picked per run
@@ -82,10 +82,10 @@ Starting defaults (changeable in config). With the effort judge on, the effort c
 
 | Feature | Status |
 |---|---|
-| `crabby "<task>"` with no agent named: the router picks one or several agents | planned |
-| Router reads the catalogue by name and description, with no hard-coded agent list | planned |
-| Plan output: ordered steps, the agent for each, its instruction, and which steps depend on which | planned |
-| Steps the router cannot match to any agent are marked unassigned, not forced onto a poor fit | planned |
+| `crabby plan "<task>"`: the router picks one or several agents and prints a plan (`--json` for scripts) | built |
+| Router reads the catalogue by name and description, with no hard-coded agent list | built |
+| Plan output: ordered steps, the agent for each, its instruction, and which steps depend on which | built |
+| Steps the router cannot match to any agent are marked unassigned, not forced onto a poor fit | built |
 | Plan approval before anything runs: accept, drop a step, swap an agent, change model or effort, or retype the task | planned |
 | `--yes` to skip approval for unattended runs | planned |
 | Saved pipelines: a named sequence in a file, run the same way every time | planned |
@@ -132,7 +132,7 @@ Starting defaults (changeable in config). With the effort judge on, the effort c
 | **Read less:** long tool output (test runs, logs, JSON, CSV) shrunk before the agent reads it | planned |
 | Hand-offs between steps carry the result block and the files changed, not the whole transcript | planned |
 | Prompt cache kept warm between steps of the same plan, so later steps re-read less at full price | planned |
-| **Token ledger:** tokens in, tokens out, cache hits and cost per agent run, per step and per plan | planned |
+| **Token ledger:** tokens in, tokens out, cache hits and cost per agent run, per step and per plan | built per run and per routing call; per plan planned |
 | Savings shown against an estimate of the same run without Caveman | planned |
 | `crabby stats`: where tokens went across past runs, by agent and by model | planned |
 | If the Caveman CLI is installed, Crabby detects it and does not apply the voice rules twice | planned |
