@@ -2,7 +2,7 @@
 
 **An AI agent orchestrator for Claude Code, written in Rust.** Crabby ships with 152 specialist agents (Rust, Go, Python, TypeScript, Kubernetes, security review, documentation and more) and runs the right one on your task from the terminal, with the model, reasoning effort and token cost under your control.
 
-Crabby is at an early stage. Running a single agent works today; automatic agent selection, multi-agent plans and the chat interface are being built. [FEATURES.md](FEATURES.md) marks every feature as built or planned.
+Crabby is at an early stage. Running a single agent and planning which agents a task needs work today; running a multi-agent plan and the chat interface are being built. [FEATURES.md](FEATURES.md) marks every feature as built or planned.
 
 ## What works today
 
@@ -40,7 +40,20 @@ crabby run sc-code-reviewer --model sonnet --effort high "review the changes in 
 
 # Read the task from a file
 crabby run sc-docs-engineer - < task.md
+
+# Let Crabby choose the agents: prints a plan, runs nothing
+crabby plan "add rate limiting to the upload endpoint and cover it with tests"
+crabby plan --json "fix the flaky checkout test"
 ```
+
+A plan lists one step per line with the agent, model, effort and what it depends on:
+
+```
+1  sc-backend-engineer          sonnet · medium  Add a rate limiter to the upload route …
+2  sc-test-automation-engineer  sonnet · medium  after 1 · Write tests for the limiter …
+```
+
+Choosing the agents costs about 8,000 input tokens on Haiku, a fraction of a cent.
 
 After a run, Crabby prints one line with what it cost:
 
@@ -82,7 +95,7 @@ crabby --agents-dir ../sc-agents/categories list
 
 Planned, in order. Details are in [FEATURES.md](FEATURES.md).
 
-1. **Router:** describe a task and Crabby picks one or several agents and drafts a plan for you to approve.
+1. **Plan approval:** accept, edit or reject the plan Crabby drafts before anything runs.
 2. **Multi-agent execution:** independent steps in parallel, results passed between steps, a review stage after every change.
 3. **Chat interface:** a terminal chat with slash commands such as `/orchestrate`, `/review`, `/docs` and `/create-issue`.
 4. **Token savings:** effort picked per step, terse agent-to-agent hand-offs, and a token ledger.
